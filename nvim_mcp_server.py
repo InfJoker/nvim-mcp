@@ -12,9 +12,11 @@ import fcntl
 import functools
 import json
 import os
+import platform
 import pty
 import re
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -23,6 +25,7 @@ import termios
 import threading
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
 
 import socket as socket_mod
@@ -54,6 +57,10 @@ _RPC_DEFAULT_TIMEOUT = 10.0
 _RPC_FLUSH_TIMEOUT = 1.0
 _HEALTH_CHECK_TIMEOUT = 30.0
 _MAX_TERMINAL_SIZE = 500
+_TERMINAL_SOCKET_CONNECT_TIMEOUT = 15.0
+_TERMINAL_NAMES = {"kitty", "ghostty", "iterm2"}
+_WINDOW_ID_POLL_TIMEOUT = 5.0
+_WINDOW_ID_POLL_INTERVAL = 0.3
 
 _VALID_SEVERITIES = {"ERROR", "WARN", "INFO", "HINT"}
 
@@ -137,6 +144,9 @@ class NvimRPC:
     def exec_lua(self, code: str, *args: object) -> object:
         return self._call("nvim_exec_lua", [code, list(args)])
 
+    def input(self, keys: str) -> int:
+        return self._call("nvim_input", [keys])
+
     def feedkeys(self, keys: str, mode: str, escape_ks: bool) -> None:
         self._call("nvim_feedkeys", [keys, mode, escape_ks])
 
@@ -208,6 +218,11 @@ class NvimSession:
     pty_reader_active: threading.Event = field(default_factory=threading.Event)
     pty_reader_paused: threading.Event = field(default_factory=threading.Event)
     pty_reader_ref: threading.Thread | None = None
+    terminal: str | None = None
+    terminal_proc: subprocess.Popen | None = None
+    terminal_window_id: int | None = None
+    terminal_title: str | None = None
+    kitty_socket: str | None = None
 
 
 _session: NvimSession | None = None
@@ -568,6 +583,8 @@ def _cleanup() -> None:
     """Best-effort cleanup on interpreter exit."""
     if _session is None:
         return
+    if _session.terminal is not None:
+        _teardown_terminal(_session)
     if _session.proc is not None:
         try:
             os.killpg(_session.proc.pid, signal.SIGTERM)
@@ -660,6 +677,304 @@ def _dismiss_press_enter(s: NvimSession) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Terminal mode helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_terminal_available(terminal: str) -> str | None:
+    """Validate that the terminal emulator is installed. Returns error or None."""
+    terminal = terminal.lower()
+    if terminal not in _TERMINAL_NAMES:
+        return f"Unknown terminal '{terminal}'. Supported: {', '.join(sorted(_TERMINAL_NAMES))}"
+
+    if terminal == "iterm2":
+        if platform.system() != "Darwin":
+            return "iTerm2 is only available on macOS."
+        # Check for app bundle
+        if not os.path.isdir("/Applications/iTerm.app"):
+            return "iTerm2 not found at /Applications/iTerm.app"
+        return None
+
+    # kitty and ghostty — check via shutil.which
+    if shutil.which(terminal) is None:
+        # Also check macOS app bundle paths
+        if platform.system() == "Darwin":
+            app_paths = {
+                "kitty": "/Applications/kitty.app/Contents/MacOS/kitty",
+                "ghostty": "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            }
+            path = app_paths.get(terminal)
+            if path and os.path.isfile(path):
+                return None
+        return f"'{terminal}' not found in PATH. Install it first."
+    return None
+
+
+def _find_window_id(pid: int | None = None, title: str | None = None) -> int | None:
+    """Find a macOS CGWindowID by PID or window title.
+
+    Tries Quartz framework first, falls back to osascript.
+    Returns None on Linux or if the window is not found.
+    """
+    if platform.system() != "Darwin":
+        return None
+
+    deadline = time.time() + _WINDOW_ID_POLL_TIMEOUT
+    while time.time() < deadline:
+        wid = _find_window_id_once(pid=pid, title=title)
+        if wid is not None:
+            return wid
+        time.sleep(_WINDOW_ID_POLL_INTERVAL)
+    return None
+
+
+def _find_window_id_once(pid: int | None = None, title: str | None = None) -> int | None:
+    """Single attempt to find window ID via Quartz or osascript fallback."""
+    # Try Quartz first
+    try:
+        from Quartz import (  # type: ignore[import-untyped]
+            CGWindowListCopyWindowInfo,
+            kCGNullWindowID,
+            kCGWindowListOptionOnScreenOnly,
+        )
+        windows = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly, kCGNullWindowID
+        )
+        if windows:
+            for win in windows:
+                if pid is not None and win.get("kCGWindowOwnerPID") == pid:
+                    wid = win.get("kCGWindowNumber")
+                    if wid:
+                        return int(wid)
+                if title is not None and title in str(win.get("kCGWindowName", "")):
+                    wid = win.get("kCGWindowNumber")
+                    if wid:
+                        return int(wid)
+    except ImportError:
+        pass
+
+    # Fallback: osascript
+    if pid is not None:
+        try:
+            result = subprocess.run(
+                [
+                    "osascript", "-e",
+                    f'tell application "System Events" to get id of first window of '
+                    f'(first process whose unix id is {pid})',
+                ],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                return int(result.stdout.strip())
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    return None
+
+
+def _dismiss_press_enter_rpc(s: NvimSession) -> None:
+    """Dismiss 'Press ENTER' prompts via nvim_input() RPC (no PTY needed)."""
+    if s.nvim is None or not isinstance(s.nvim, NvimRPC):
+        return
+    s.nvim.set_timeout(_RPC_POLL_TIMEOUT)
+    deadline = time.time() + _ADAPTIVE_STARTUP_TIMEOUT
+    while time.time() < deadline:
+        try:
+            s.nvim.eval("1")
+            break
+        except _NVIM_ERRORS:
+            try:
+                s.nvim.input("\r")
+            except _NVIM_ERRORS:
+                pass
+            time.sleep(_ADAPTIVE_STARTUP_POLL_INTERVAL)
+    s.nvim.set_timeout(_SOCKET_CONNECT_TIMEOUT)
+
+
+def _start_terminal(
+    terminal: str,
+    cmd_extra: list[str] | None,
+    clean: bool,
+    env: dict[str, str],
+    rows: int,
+    cols: int,
+) -> tuple[NvimSession, str | None]:
+    """Start nvim inside a real terminal emulator. Returns (session, error_or_None)."""
+    s = NvimSession()
+    s.terminal = terminal.lower()
+    s.terminal_title = f"nvim-mcp-{uuid.uuid4().hex[:12]}"
+
+    s.socket_dir = tempfile.mkdtemp(prefix=f"nvim-mcp-{os.getpid()}-")
+    s.socket_path = os.path.join(s.socket_dir, "nvim.sock")
+
+    nvim_cmd_parts = ["nvim", "--listen", s.socket_path, "--cmd", "set nomore"]
+    if clean:
+        nvim_cmd_parts.append("--clean")
+    if cmd_extra:
+        nvim_cmd_parts.extend(cmd_extra)
+
+    try:
+        if s.terminal == "kitty":
+            s.kitty_socket = os.path.join(s.socket_dir, "kitty.sock")
+            kitty_bin = shutil.which("kitty") or "/Applications/kitty.app/Contents/MacOS/kitty"
+            cmd = [
+                kitty_bin,
+                "--single-instance=no",
+                f"--title={s.terminal_title}",
+                f"--listen-on=unix:{s.kitty_socket}",
+                "-e",
+            ] + nvim_cmd_parts
+            s.terminal_proc = subprocess.Popen(cmd, env=env, process_group=0)
+
+        elif s.terminal == "ghostty":
+            ghostty_bin = shutil.which("ghostty") or "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+            cmd = [
+                ghostty_bin,
+                f"--title={s.terminal_title}",
+                "-e",
+            ] + nvim_cmd_parts
+            s.terminal_proc = subprocess.Popen(cmd, env=env, process_group=0)
+
+        elif s.terminal == "iterm2":
+            nvim_cmd_str = " ".join(
+                arg.replace("\\", "\\\\").replace('"', '\\"')
+                for arg in nvim_cmd_parts
+            )
+            applescript = (
+                f'tell application "iTerm2"\n'
+                f'  create window with default profile command "{nvim_cmd_str}"\n'
+                f'  tell current session of current window\n'
+                f'    set name to "{s.terminal_title}"\n'
+                f'  end tell\n'
+                f'end tell'
+            )
+            result = subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            if result.returncode != 0:
+                return s, f"Failed to launch iTerm2: {result.stderr.strip()}"
+            # iTerm2 launch is async — no terminal_proc to track
+
+    except Exception as e:
+        return s, f"Failed to launch {terminal}: {e}"
+
+    # Connect to nvim's RPC socket
+    conn = _wait_for_socket(s.socket_path, timeout=_TERMINAL_SOCKET_CONNECT_TIMEOUT)
+    if conn is None:
+        _teardown_terminal(s)
+        return s, f"Failed to connect to Neovim socket (timeout). Is {terminal} running?"
+
+    s.nvim = conn
+
+    _dismiss_press_enter_rpc(s)
+
+    # Find window ID for screenshots (macOS only)
+    if platform.system() == "Darwin":
+        if s.terminal == "iterm2":
+            s.terminal_window_id = _find_window_id(title=s.terminal_title)
+        elif s.terminal_proc is not None:
+            s.terminal_window_id = _find_window_id(pid=s.terminal_proc.pid)
+            # Fallback to title if PID lookup fails
+            if s.terminal_window_id is None:
+                s.terminal_window_id = _find_window_id(title=s.terminal_title)
+
+    return s, None
+
+
+def _teardown_terminal(s: NvimSession) -> None:
+    """Terminate the terminal emulator process."""
+    if s.terminal_proc is not None:
+        try:
+            os.killpg(s.terminal_proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            s.terminal_proc.wait(timeout=_PROCESS_TERM_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(s.terminal_proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                s.terminal_proc.wait(timeout=_PROCESS_KILL_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pass
+        s.terminal_proc = None
+
+    if s.terminal == "iterm2":
+        # Best-effort close the iTerm2 window by title
+        try:
+            subprocess.run(
+                [
+                    "osascript", "-e",
+                    f'tell application "iTerm2"\n'
+                    f'  repeat with w in windows\n'
+                    f'    repeat with t in tabs of w\n'
+                    f'      repeat with sess in sessions of t\n'
+                    f'        if name of sess is "{s.terminal_title}" then\n'
+                    f'          close w\n'
+                    f'          return\n'
+                    f'        end if\n'
+                    f'      end repeat\n'
+                    f'    end repeat\n'
+                    f'  end repeat\n'
+                    f'end tell',
+                ],
+                capture_output=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # Clean up kitty socket
+    if s.kitty_socket and os.path.exists(s.kitty_socket):
+        try:
+            os.unlink(s.kitty_socket)
+        except OSError:
+            pass
+        s.kitty_socket = None
+
+
+def _capture_window(window_id: int, path: str) -> str | None:
+    """Capture a window screenshot. Returns error string or None on success.
+
+    macOS: uses screencapture -l. Linux: not yet supported.
+    """
+    if platform.system() != "Darwin":
+        return "Terminal screenshots are not yet supported on Linux."
+    try:
+        result = subprocess.run(
+            ["screencapture", "-l", str(window_id), path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return f"screencapture failed: {result.stderr.strip()}"
+        # Check for blank/tiny screenshots (permissions issue)
+        if os.path.isfile(path) and os.path.getsize(path) < 500:
+            return (
+                "Screenshot appears blank (< 500 bytes). "
+                "Check macOS Screen Recording permissions for your terminal."
+            )
+        return None
+    except subprocess.TimeoutExpired:
+        return "screencapture timed out."
+    except FileNotFoundError:
+        return "screencapture not found."
+
+
+def _screenshot_terminal(s: NvimSession, path: str) -> str:
+    """Take a screenshot of the terminal window. Returns file path or error."""
+    if s.terminal_window_id is None:
+        if platform.system() != "Darwin":
+            return "Error: terminal screenshots are not yet supported on Linux."
+        return "Error: terminal window ID not found. Cannot capture screenshot."
+
+    err = _capture_window(s.terminal_window_id, path)
+    if err:
+        return f"Error: {err}"
+    return os.path.abspath(path)
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 
@@ -742,11 +1057,14 @@ def nvim_start(
     config: str = "~/.config/nvim",
     clean: bool = False,
     headless: bool = False,
+    terminal: str = "",
     args: list[str] | None = None,
     rows: int = 24,
     cols: int = 80,
 ) -> str:
     """Start an embedded Neovim instance.
+
+    Always call first. Check nvim_is_running before starting a second instance.
 
     Args:
         config: Path to the Neovim config directory (must be named "nvim",
@@ -754,6 +1072,9 @@ def nvim_start(
         clean: If True, start with --clean (no config/plugins).
         headless: If True, start with --headless --embed (no PTY, no screenshots).
                   If False (default), start with PTY + socket for full screenshot support.
+        terminal: Launch nvim inside a real terminal emulator for pixel-perfect
+                  screenshots. Supported: "kitty", "ghostty", "iterm2" (macOS only).
+                  Mutually exclusive with headless. Empty string (default) uses PTY mode.
         args: Extra CLI arguments to pass to nvim.
         rows: Terminal rows (only used when headless=False).
         cols: Terminal columns (only used when headless=False).
@@ -763,7 +1084,15 @@ def nvim_start(
     if _session is not None and _session.nvim is not None:
         return f"Neovim is already running (PID {_session.pid}). Stop it first."
 
-    if not headless and (rows < 1 or cols < 1 or rows > _MAX_TERMINAL_SIZE or cols > _MAX_TERMINAL_SIZE):
+    if terminal and headless:
+        return "Error: 'terminal' and 'headless' are mutually exclusive."
+
+    if terminal:
+        term_err = _check_terminal_available(terminal)
+        if term_err:
+            return f"Error: {term_err}"
+
+    if not headless and not terminal and (rows < 1 or cols < 1 or rows > _MAX_TERMINAL_SIZE or cols > _MAX_TERMINAL_SIZE):
         return f"Error: rows and cols must be between 1 and {_MAX_TERMINAL_SIZE}."
 
     config = os.path.expanduser(config)
@@ -774,6 +1103,11 @@ def nvim_start(
 
     if headless:
         s, err = _start_headless(cmd_extra=args, clean=clean, env=env)
+    elif terminal:
+        s, err = _start_terminal(
+            terminal=terminal, cmd_extra=args, clean=clean, env=env,
+            rows=rows, cols=cols,
+        )
     else:
         s, err = _start_pty(cmd_extra=args, clean=clean, env=env, rows=rows, cols=cols)
     if err:
@@ -783,7 +1117,21 @@ def nvim_start(
         s.pid = s.nvim.eval("getpid()")
     except _NVIM_ERRORS:
         # May be blocked on wait_return from plugin errors — dismiss and retry
-        if not headless and s.pty_master_fd is not None:
+        if terminal:
+            # Terminal mode: dismiss via RPC input
+            try:
+                if isinstance(s.nvim, NvimRPC):
+                    s.nvim.input("\r")
+            except _NVIM_ERRORS:
+                pass
+            time.sleep(_ADAPTIVE_STARTUP_POLL_INTERVAL)
+            try:
+                s.pid = s.nvim.eval("getpid()")
+            except _NVIM_ERRORS as e:
+                _teardown(s, kill_proc=True)
+                _teardown_terminal(s)
+                return f"Failed to initialize Neovim: {e}"
+        elif not headless and s.pty_master_fd is not None:
             try:
                 os.write(s.pty_master_fd, b"\r")
             except OSError:
@@ -804,7 +1152,12 @@ def nvim_start(
 
     if not clean and os.path.isdir(config):
         if not _wait_for_lazy(_session, timeout=_LAZY_LOAD_TIMEOUT):
-            mode_label = "PTY" if not headless else "headless"
+            if terminal:
+                mode_label = f"terminal:{terminal}"
+            elif headless:
+                mode_label = "headless"
+            else:
+                mode_label = "PTY"
             # Restore 'more' before returning on timeout
             if not headless:
                 try:
@@ -814,7 +1167,7 @@ def nvim_start(
             msg += f", {mode_label}). Warning: lazy.nvim did not finish loading within {_LAZY_LOAD_TIMEOUT}s."
             return msg
 
-    # Restore 'more' option after lazy.nvim finishes (PTY mode only).
+    # Restore 'more' option after lazy.nvim finishes.
     # Kept off during loading so plugin errors don't trigger "-- More --" pager.
     if not headless:
         try:
@@ -822,20 +1175,27 @@ def nvim_start(
         except Exception:
             pass
 
-    mode_str = "headless" if headless else f"PTY {cols}x{rows}"
+    if terminal:
+        mode_str = f"terminal:{terminal}"
+    elif headless:
+        mode_str = "headless"
+    else:
+        mode_str = f"PTY {cols}x{rows}"
     return f"Neovim started (PID {_session.pid}, {mode_str})."
 
 
 def _wait_for_lazy(s: NvimSession, timeout: int = _LAZY_LOAD_TIMEOUT) -> bool:
     """Poll until lazy.nvim reports all plugins are loaded, or timeout.
 
-    While waiting, sends \\r through the PTY to dismiss any 'Press ENTER'
-    prompts that plugins may trigger during loading.
+    While waiting, sends \\r through the PTY (or via RPC input in terminal
+    mode) to dismiss any 'Press ENTER' prompts that plugins may trigger
+    during loading.
     """
     if s.nvim is None:
         return False
     has_pty = s.pty_master_fd is not None
-    if has_pty and isinstance(s.nvim, NvimRPC):
+    has_rpc = isinstance(s.nvim, NvimRPC)
+    if (has_pty or s.terminal) and has_rpc:
         s.nvim.set_timeout(_RPC_POLL_TIMEOUT)
     deadline = time.time() + timeout
     try:
@@ -854,9 +1214,14 @@ def _wait_for_lazy(s: NvimSession, timeout: int = _LAZY_LOAD_TIMEOUT) -> bool:
                         os.write(s.pty_master_fd, b"\r")
                     except OSError:
                         pass
+                elif s.terminal and has_rpc:
+                    try:
+                        s.nvim.input("\r")
+                    except _NVIM_ERRORS:
+                        pass
             time.sleep(_ADAPTIVE_STARTUP_POLL_INTERVAL)
     finally:
-        if has_pty and isinstance(s.nvim, NvimRPC):
+        if (has_pty or s.terminal) and has_rpc:
             s.nvim.set_timeout(_SOCKET_CONNECT_TIMEOUT)
     return False
 
@@ -871,6 +1236,7 @@ def nvim_stop() -> str:
 
     pid = _session.pid
     was_headless = _session.proc is None
+    was_terminal = _session.terminal is not None
 
     try:
         _session.nvim.command("qall!")
@@ -879,8 +1245,11 @@ def nvim_stop() -> str:
 
     _teardown(_session, kill_proc=True)
 
+    if was_terminal:
+        _teardown_terminal(_session)
+
     # Headless/embed mode: no subprocess, kill by PID
-    if was_headless and pid is not None:
+    if was_headless and not was_terminal and pid is not None:
         try:
             os.kill(pid, 0)
             os.kill(pid, signal.SIGTERM)
@@ -921,6 +1290,9 @@ def nvim_is_running() -> str:
 def nvim_execute(command: str, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
     """Execute an Ex command in Neovim and return its output.
 
+    Common commands: "edit <file>", "Lazy sync", "checkhealth", "w", "bdelete".
+    Returns command output only — use nvim_get_buffer to read buffer contents.
+
     Args:
         command: The Ex command to run (without leading colon), e.g. "Lazy health".
         timeout: RPC timeout in seconds. Increase for slow commands (e.g. Lazy sync).
@@ -937,6 +1309,8 @@ def nvim_execute(command: str, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
 @mcp.tool()
 def nvim_lua(code: str, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
     """Execute Lua code in Neovim and return the result as JSON.
+
+    Use for anything not expressible as an Ex command. Must use 'return' to get values back.
 
     Args:
         code: Lua code to execute. Use 'return' to get a value back.
@@ -956,9 +1330,9 @@ def nvim_lua(code: str, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
 def nvim_send_keys(keys: str, escape: bool = True, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
     """Send keystrokes to Neovim.
 
-    Uses RPC by default. If RPC times out (e.g. nvim is blocked by a
-    floating window or terminal mode), falls back to writing raw bytes
-    through the PTY fd.
+    Prefer nvim_execute for Ex commands — use this for normal-mode actions,
+    insert-mode typing, or dismissing prompts. Uses RPC by default; falls back
+    to PTY write if RPC is blocked (e.g. by Telescope or ToggleTerm).
 
     Args:
         keys: Key sequence to send. Supports special keys like <CR>, <Esc>,
@@ -981,11 +1355,17 @@ def nvim_send_keys(keys: str, escape: bool = True, timeout: float = _RPC_DEFAULT
                 nvim.command("")
                 return f"Sent keys: {keys}"
             except _NVIM_ERRORS:
-                # RPC blocked — fall back to PTY raw write
+                # RPC blocked — fall back to PTY raw write or RPC input
                 if _session and _session.pty_master_fd is not None:
                     raw = _keys_to_raw(keys)
                     if raw and _pty_send_raw(_session, raw):
                         return f"Sent keys via PTY (RPC was blocked): {keys}"
+                elif _session and _session.terminal and isinstance(_session.nvim, NvimRPC):
+                    try:
+                        _session.nvim.input(keys)
+                        return f"Sent keys via nvim_input (RPC feedkeys was blocked): {keys}"
+                    except _NVIM_ERRORS:
+                        pass
                 raise
     except _NVIM_ERRORS as e:
         return f"Error: {e}"
@@ -1055,6 +1435,9 @@ def _keys_to_raw(keys: str) -> bytes:
 def nvim_get_buffer(buffer_id: int = 0) -> str:
     """Get the contents of a buffer.
 
+    Use after nvim_execute("edit ...") to read file contents, or to inspect
+    output buffers like :checkhealth.
+
     Args:
         buffer_id: Buffer number (handle). 0 means current buffer.
     """
@@ -1072,7 +1455,10 @@ def nvim_get_buffer(buffer_id: int = 0) -> str:
 
 @mcp.tool()
 def nvim_get_state() -> str:
-    """Get current Neovim state: mode, cursor, file, modified, filetype, buffers, cwd."""
+    """Get current Neovim state: mode, cursor, file, modified, filetype, buffers, cwd.
+
+    Call first to orient — shows what file is open, cursor position, mode.
+    Use to verify effects of previous actions."""
     try:
         nvim = _require_nvim()
         state = nvim.exec_lua("""
@@ -1105,6 +1491,9 @@ def nvim_get_state() -> str:
 def nvim_get_messages(clear: bool = False) -> str:
     """Get Neovim's :messages output. Primary tool for checking errors.
 
+    Call after nvim_start to check startup errors. Call after any command
+    that might produce warnings.
+
     Args:
         clear: If True, clear messages after reading.
     """
@@ -1121,6 +1510,9 @@ def nvim_get_messages(clear: bool = False) -> str:
 @mcp.tool()
 def nvim_get_diagnostics(buffer_id: int = 0, severity: str = "") -> str:
     """Get LSP diagnostics for a buffer.
+
+    Requires LSP to be attached — open a file with a configured server first.
+    Returns empty list if no LSP is active.
 
     Args:
         buffer_id: Buffer number. 0 means current buffer.
@@ -1164,17 +1556,39 @@ def nvim_get_diagnostics(buffer_id: int = 0, severity: str = "") -> str:
 def nvim_screenshot(output_path: str = "") -> str:
     """Capture a PNG screenshot of the current Neovim terminal display.
 
+    Use to see visual state when text tools aren't enough (UI popups, color
+    themes, layout). Read the returned path with the Read tool to view the image.
+    In PTY mode: renders the pyte terminal emulator to PNG.
+    In terminal mode: captures the actual terminal window via screencapture (macOS).
     Works even when RPC is blocked (e.g. by Telescope or ToggleTerm).
-    The screenshot shows whatever is currently rendered in the terminal.
 
     Args:
         output_path: File path for the PNG. If empty, uses a temp file.
     """
     try:
         _require_nvim()
-        if _session.pyte_screen is None:
-            return "Error: screenshot not available (nvim started in headless mode)"
         s = _session
+
+        if not output_path:
+            f = tempfile.NamedTemporaryFile(
+                suffix=".png", prefix="nvim-screenshot-", delete=False
+            )
+            output_path = f.name
+            f.close()
+
+        # Terminal mode — capture actual window
+        if s.terminal is not None:
+            # Try RPC flush with short timeout
+            with _rpc_timeout(s.nvim, _RPC_FLUSH_TIMEOUT):
+                try:
+                    s.nvim.eval("1")
+                except _NVIM_ERRORS:
+                    pass
+            return _screenshot_terminal(s, output_path)
+
+        # PTY mode — render pyte screen
+        if s.pyte_screen is None:
+            return "Error: screenshot not available (nvim started in headless mode)"
         # Try RPC flush with short timeout; proceed with screenshot regardless
         with _rpc_timeout(s.nvim, _RPC_FLUSH_TIMEOUT):
             try:
@@ -1182,12 +1596,6 @@ def nvim_screenshot(output_path: str = "") -> str:
             except _NVIM_ERRORS:
                 pass  # RPC blocked — screenshot from current PTY state anyway
         with _with_drained_pty(s, quiet_ms=_DRAIN_QUIET_MS):
-            if not output_path:
-                f = tempfile.NamedTemporaryFile(
-                    suffix=".png", prefix="nvim-screenshot-", delete=False
-                )
-                output_path = f.name
-                f.close()
             with s.pty_lock:
                 _render_screen_to_png(s.pyte_screen, output_path)
         return os.path.abspath(output_path)
@@ -1293,10 +1701,10 @@ def _check_diagnostics(nvim: pynvim.Nvim | NvimRPC) -> str | None:
 def nvim_health_check() -> str:
     """Comprehensive config health check.
 
-    Runs nvim's built-in :checkhealth, checks :messages for startup errors,
-    triggers lazy-loaded plugins by opening a scratch buffer (fires FileType
-    autocommands), then reports all errors and plugin statuses. This catches
-    errors that only surface when lazy-loaded plugins are activated.
+    Slow (~5-10s). Use only after config changes, plugin updates, or nvim
+    upgrades — not for routine checks. For quick error checks, use
+    nvim_get_messages instead. Runs :checkhealth, checks :messages, triggers
+    lazy-loaded plugins, then reports all errors and plugin statuses.
     """
     try:
         nvim = _require_nvim()
