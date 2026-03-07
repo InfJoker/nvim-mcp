@@ -62,11 +62,20 @@ Tool descriptions and usage guidance are in the tool docstrings (visible to AI m
 ## Testing
 
 ```bash
-uv run python tests/test_smoke.py              # PTY mode with full config
-uv run python tests/test_smoke.py --clean      # PTY mode, no config
-uv run python tests/test_smoke.py --headless --clean  # Headless mode
+uv run python tests/test_smoke.py                        # PTY mode with full config
+uv run python tests/test_smoke.py --clean                # PTY mode, no config
+uv run python tests/test_smoke.py --headless --clean     # Headless mode
+uv run python tests/test_smoke.py --terminal kitty       # Terminal mode (Kitty)
+uv run python tests/test_smoke.py --terminal ghostty     # Terminal mode (Ghostty)
+uv run python tests/test_smoke.py --terminal iterm2      # Terminal mode (iTerm2, macOS)
 ```
+
+Add `--clean` to any terminal mode test to skip loading your nvim config.
 
 ## How It Works
 
-By default, spawns Neovim in a PTY with `--listen <socket>` and connects via pynvim's socket RPC. A background `pyte` virtual terminal captures the TUI output, enabling PNG screenshots via Pillow. Pass `headless=True` to use the lighter `--embed --headless` mode (no screenshot support).
+Three operating modes:
+
+- **PTY mode** (default): Spawns nvim in a pseudo-terminal with `--listen <socket>`. Connects via msgpack-rpc. A background `pyte` virtual terminal captures TUI output for PNG screenshots.
+- **Headless mode**: Uses `pynvim.attach("child", argv=["nvim", "--embed", "--headless"])`. No screenshots. Lighter weight.
+- **Terminal mode** (macOS only): Launches nvim inside a real terminal emulator (Kitty, Ghostty, iTerm2). Screenshots via macOS `screencapture`. Terminals launch in the background without stealing focus. Linux support is not yet implemented.

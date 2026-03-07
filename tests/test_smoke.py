@@ -1,9 +1,12 @@
 """Smoke test: start nvim, exercise every tool, stop.
 
 Usage:
-    uv run python tests/test_smoke.py              # PTY mode (default)
-    uv run python tests/test_smoke.py --headless   # headless mode
-    uv run python tests/test_smoke.py --clean      # PTY + --clean (no config)
+    uv run python tests/test_smoke.py                         # PTY mode (default)
+    uv run python tests/test_smoke.py --headless              # headless mode
+    uv run python tests/test_smoke.py --clean                 # PTY + --clean (no config)
+    uv run python tests/test_smoke.py --terminal kitty --clean   # terminal mode
+    uv run python tests/test_smoke.py --terminal ghostty --clean
+    uv run python tests/test_smoke.py --terminal iterm2 --clean
 """
 
 from __future__ import annotations
@@ -51,6 +54,14 @@ def check(name: str, result: str, *, ok: Callable[[str], bool] | None = None) ->
 def main() -> int:
     headless = "--headless" in sys.argv
     clean = "--clean" in sys.argv
+    terminal = ""
+    if "--terminal" in sys.argv:
+        idx = sys.argv.index("--terminal")
+        if idx + 1 < len(sys.argv):
+            terminal = sys.argv[idx + 1]
+        else:
+            print("Error: --terminal requires a value (kitty, ghostty, iterm2)")
+            return 1
 
     # Reset module state in case a previous run left nvim running
     import nvim_mcp_server as _mod
@@ -81,7 +92,12 @@ def main() -> int:
     check("is_running (before start)", nvim_is_running(), ok=lambda r: '"running": false' in r)
 
     # -- start -------------------------------------------------------------
-    mode_label = "headless" if headless else "PTY"
+    if terminal:
+        mode_label = f"terminal:{terminal}"
+    elif headless:
+        mode_label = "headless"
+    else:
+        mode_label = "PTY"
     if clean:
         mode_label += "+clean"
     print(f"starting nvim ({mode_label})...")
@@ -90,6 +106,7 @@ def main() -> int:
         config="~/.config/nvim",
         clean=clean,
         headless=headless,
+        terminal=terminal,
         rows=30,
         cols=100,
     )
@@ -141,6 +158,17 @@ def main() -> int:
     if headless:
         ss = nvim_screenshot()
         check("screenshot (headless=unavailable)", ss, ok=lambda r: "headless" in r.lower() or "not available" in r.lower())
+    elif terminal:
+        ss = nvim_screenshot()
+        if ss.startswith("Error"):
+            # Terminal screenshots may fail on Linux or without permissions
+            check("screenshot (terminal)", ss, ok=lambda r: "not yet supported" in r.lower() or "not found" in r.lower() or "permission" in r.lower())
+        else:
+            check("screenshot exists", ss, ok=lambda r: r.endswith(".png") and os.path.isfile(r))
+            if os.path.isfile(ss):
+                size = os.path.getsize(ss)
+                check("screenshot size", str(size), ok=lambda _: size > 1000)
+                os.unlink(ss)
     else:
         ss = nvim_screenshot()
         check("screenshot exists", ss, ok=lambda r: r.endswith(".png") and os.path.isfile(r))
@@ -151,8 +179,38 @@ def main() -> int:
 
     # -- stop --------------------------------------------------------------
     print("stop")
+    # Capture terminal title before stop (for orphan check)
+    _terminal_title = None
+    if _mod._session is not None:
+        _terminal_title = _mod._session.terminal_title
     check("nvim_stop", nvim_stop(), ok=lambda r: "stopped" in r.lower())
     check("is_running (after stop)", nvim_is_running(), ok=lambda r: '"running": false' in r)
+
+    # Verify no orphaned terminal windows remain
+    if terminal and _terminal_title and sys.platform == "darwin":
+        import subprocess as _sp
+        import time as _time
+
+        _time.sleep(1)  # Allow terminal to close after nvim exit
+        _orphan_found = False
+        try:
+            r = _sp.run(
+                ["osascript", "-e",
+                 f'tell application "System Events"\n'
+                 f'  repeat with proc in every process\n'
+                 f'    repeat with w in windows of proc\n'
+                 f'      if name of w contains "{_terminal_title}" then return "found"\n'
+                 f'    end repeat\n'
+                 f'  end repeat\n'
+                 f'end tell\n'
+                 f'return "none"'],
+                capture_output=True, text=True, timeout=5,
+            )
+            _orphan_found = "found" in r.stdout
+        except Exception:
+            pass
+        check("no orphan window", "clean" if not _orphan_found else f"orphan: {_terminal_title}",
+              ok=lambda r: r == "clean")
 
     # -- summary -----------------------------------------------------------
     total = _pass_count + len(_failures)

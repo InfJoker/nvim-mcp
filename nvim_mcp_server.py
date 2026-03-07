@@ -16,6 +16,7 @@ import platform
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -61,6 +62,11 @@ _TERMINAL_SOCKET_CONNECT_TIMEOUT = 15.0
 _TERMINAL_NAMES = {"kitty", "ghostty", "iterm2"}
 _WINDOW_ID_POLL_TIMEOUT = 5.0
 _WINDOW_ID_POLL_INTERVAL = 0.3
+_OSASCRIPT_FALLBACK_TIMEOUT = 3
+_APPLESCRIPT_FOCUS_DELAY = 0.5
+_APPLESCRIPT_LAUNCH_TIMEOUT = 15
+_KITTEN_QUIT_TIMEOUT = 5
+_ITERM2_CLOSE_TIMEOUT = 5
 
 _VALID_SEVERITIES = {"ERROR", "WARN", "INFO", "HINT"}
 
@@ -223,6 +229,8 @@ class NvimSession:
     terminal_window_id: int | None = None
     terminal_title: str | None = None
     kitty_socket: str | None = None
+    kitty_pid: int | None = None  # Discovered via Quartz after launch (no terminal_proc with open -gna)
+    iterm2_window_id: str | None = None  # AppleScript window ID (str), vs terminal_window_id (CGWindowID int)
 
 
 _session: NvimSession | None = None
@@ -762,12 +770,49 @@ def _find_window_id_once(pid: int | None = None, title: str | None = None) -> in
                     f'tell application "System Events" to get id of first window of '
                     f'(first process whose unix id is {pid})',
                 ],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True, text=True, timeout=_OSASCRIPT_FALLBACK_TIMEOUT,
             )
             if result.returncode == 0 and result.stdout.strip().isdigit():
                 return int(result.stdout.strip())
         except (subprocess.TimeoutExpired, OSError):
             pass
+    if title is not None:
+        try:
+            result = subprocess.run(
+                [
+                    "osascript", "-e",
+                    f'tell application "System Events"\n'
+                    f'  repeat with proc in every process\n'
+                    f'    repeat with w in windows of proc\n'
+                    f'      if name of w contains "{title}" then return id of w\n'
+                    f'    end repeat\n'
+                    f'  end repeat\n'
+                    f'end tell',
+                ],
+                capture_output=True, text=True, timeout=_OSASCRIPT_FALLBACK_TIMEOUT,
+            )
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                return int(result.stdout.strip())
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    return None
+
+
+def _get_window_owner_pid(window_id: int) -> int | None:
+    """Return the PID of the process that owns a CGWindowID, or None."""
+    try:
+        from Quartz import (  # type: ignore[import-untyped]
+            CGWindowListCopyWindowInfo,
+            kCGWindowListOptionIncludingWindow,
+        )
+        windows = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionIncludingWindow, window_id
+        )
+        if windows:
+            pid = windows[0].get("kCGWindowOwnerPID")
+            return int(pid) if pid else None
+    except ImportError:
+        pass
     return None
 
 
@@ -790,6 +835,14 @@ def _dismiss_press_enter_rpc(s: NvimSession) -> None:
     s.nvim.set_timeout(_SOCKET_CONNECT_TIMEOUT)
 
 
+def _env_wrapped_cmd(env: dict[str, str], cmd: list[str]) -> list[str]:
+    """Wrap command with /usr/bin/env for vars that differ from os.environ."""
+    assignments = [f"{k}={v}" for k, v in env.items() if os.environ.get(k) != v]
+    if assignments:
+        return ["/usr/bin/env"] + assignments + cmd
+    return cmd
+
+
 def _start_terminal(
     terminal: str,
     cmd_extra: list[str] | None,
@@ -806,7 +859,9 @@ def _start_terminal(
     s.socket_dir = tempfile.mkdtemp(prefix=f"nvim-mcp-{os.getpid()}-")
     s.socket_path = os.path.join(s.socket_dir, "nvim.sock")
 
-    nvim_cmd_parts = ["nvim", "--listen", s.socket_path, "--cmd", "set nomore"]
+    # Use absolute path to nvim — terminal shells may not have it in PATH
+    nvim_bin = shutil.which("nvim") or "nvim"
+    nvim_cmd_parts = [nvim_bin, "--listen", s.socket_path, "--cmd", "set nomore"]
     if clean:
         nvim_cmd_parts.append("--clean")
     if cmd_extra:
@@ -816,14 +871,24 @@ def _start_terminal(
         if s.terminal == "kitty":
             s.kitty_socket = os.path.join(s.socket_dir, "kitty.sock")
             kitty_bin = shutil.which("kitty") or "/Applications/kitty.app/Contents/MacOS/kitty"
-            cmd = [
-                kitty_bin,
+            kitty_real = os.path.realpath(kitty_bin)
+            if ".app/" in kitty_real:
+                kitty_app = kitty_real[:kitty_real.index(".app/") + 4]
+            elif os.path.isdir("/Applications/kitty.app"):
+                kitty_app = "/Applications/kitty.app"
+            else:
+                return s, "Cannot locate kitty.app bundle (needed for background launch)"
+            exe_cmd = _env_wrapped_cmd(env, nvim_cmd_parts)
+            kitty_args = [
                 "--single-instance=no",
                 f"--title={s.terminal_title}",
                 f"--listen-on=unix:{s.kitty_socket}",
+                "-o", "close_on_child_death=yes",
+                "-o", "macos_quit_when_last_window_closed=yes",
                 "-e",
-            ] + nvim_cmd_parts
-            s.terminal_proc = subprocess.Popen(cmd, env=env, process_group=0)
+            ] + exe_cmd
+            subprocess.Popen(["open", "-gna", kitty_app, "--args"] + kitty_args)
+            # No terminal_proc — kitty spawned by launchd
 
         elif s.terminal == "ghostty":
             ghostty_bin = shutil.which("ghostty") or "/Applications/Ghostty.app/Contents/MacOS/ghostty"
@@ -835,24 +900,39 @@ def _start_terminal(
             s.terminal_proc = subprocess.Popen(cmd, env=env, process_group=0)
 
         elif s.terminal == "iterm2":
-            nvim_cmd_str = " ".join(
-                arg.replace("\\", "\\\\").replace('"', '\\"')
-                for arg in nvim_cmd_parts
-            )
+            exe_cmd = _env_wrapped_cmd(env, nvim_cmd_parts)
+            nvim_cmd_str = shlex.join(exe_cmd)
+            # Escape backslashes and double quotes for AppleScript string
+            nvim_cmd_str = nvim_cmd_str.replace("\\", "\\\\").replace('"', '\\"')
             applescript = (
+                f'tell application "System Events"\n'
+                f'  set prevProc to name of first process whose frontmost is true\n'
+                f'end tell\n'
                 f'tell application "iTerm2"\n'
-                f'  create window with default profile command "{nvim_cmd_str}"\n'
-                f'  tell current session of current window\n'
+                f'  set newWindow to (create window with default profile'
+                f' command "{nvim_cmd_str}")\n'
+                f'  set windowId to id of newWindow\n'
+                f'  tell current session of newWindow\n'
                 f'    set name to "{s.terminal_title}"\n'
                 f'  end tell\n'
-                f'end tell'
+                f'end tell\n'
+                f'try\n'
+                f'  delay {_APPLESCRIPT_FOCUS_DELAY}\n'
+                f'  tell application "System Events"\n'
+                f'    if frontmost of process "iTerm2" is true then\n'
+                f'      set frontmost of process prevProc to true\n'
+                f'    end if\n'
+                f'  end tell\n'
+                f'end try\n'
+                f'return windowId'
             )
             result = subprocess.run(
                 ["osascript", "-e", applescript],
-                capture_output=True, text=True, timeout=10, env=env,
+                capture_output=True, text=True, timeout=_APPLESCRIPT_LAUNCH_TIMEOUT, env=env,
             )
             if result.returncode != 0:
                 return s, f"Failed to launch iTerm2: {result.stderr.strip()}"
+            s.iterm2_window_id = result.stdout.strip() or None
             # iTerm2 launch is async — no terminal_proc to track
 
     except Exception as e:
@@ -870,13 +950,10 @@ def _start_terminal(
 
     # Find window ID for screenshots (macOS only)
     if platform.system() == "Darwin":
-        if s.terminal == "iterm2":
-            s.terminal_window_id = _find_window_id(title=s.terminal_title)
-        elif s.terminal_proc is not None:
-            s.terminal_window_id = _find_window_id(pid=s.terminal_proc.pid)
-            # Fallback to title if PID lookup fails
-            if s.terminal_window_id is None:
-                s.terminal_window_id = _find_window_id(title=s.terminal_title)
+        s.terminal_window_id = _find_window_id(title=s.terminal_title)
+        # Discover kitty PID now (window guaranteed to exist) for SIGTERM fallback
+        if s.terminal == "kitty" and s.terminal_window_id is not None:
+            s.kitty_pid = _get_window_owner_pid(s.terminal_window_id)
 
     return s, None
 
@@ -901,12 +978,36 @@ def _teardown_terminal(s: NvimSession) -> None:
                 pass
         s.terminal_proc = None
 
+    if s.terminal == "kitty" and s.terminal_proc is None:
+        closed = False
+        if s.kitty_socket:
+            try:
+                kitten_bin = shutil.which("kitten") or "kitten"
+                r = subprocess.run(
+                    [kitten_bin, "@", "--to", f"unix:{s.kitty_socket}", "quit"],
+                    capture_output=True, timeout=_KITTEN_QUIT_TIMEOUT,
+                )
+                closed = r.returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        # Fallback: SIGTERM the kitty process by PID (discovered at launch)
+        if not closed and s.kitty_pid is not None:
+            try:
+                os.kill(s.kitty_pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
     if s.terminal == "iterm2":
-        # Best-effort close the iTerm2 window by title
+        # Best-effort close the iTerm2 window by ID (captured at launch)
         try:
-            subprocess.run(
-                [
-                    "osascript", "-e",
+            if s.iterm2_window_id and s.iterm2_window_id.isdigit():
+                script = (
+                    f'tell application "iTerm2"\n'
+                    f'  close window id {s.iterm2_window_id}\n'
+                    f'end tell'
+                )
+            else:
+                script = (
                     f'tell application "iTerm2"\n'
                     f'  repeat with w in windows\n'
                     f'    repeat with t in tabs of w\n'
@@ -918,9 +1019,13 @@ def _teardown_terminal(s: NvimSession) -> None:
                     f'      end repeat\n'
                     f'    end repeat\n'
                     f'  end repeat\n'
-                    f'end tell',
+                    f'end tell'
+                )
+            subprocess.run(
+                [
+                    "osascript", "-e", script,
                 ],
-                capture_output=True, timeout=5,
+                capture_output=True, timeout=_ITERM2_CLOSE_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError):
             pass
