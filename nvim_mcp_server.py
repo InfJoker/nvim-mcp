@@ -6,6 +6,7 @@ interaction (commands, Lua, keystrokes), and state inspection.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import signal
@@ -19,11 +20,25 @@ mcp = FastMCP("neovim")
 _nvim: pynvim.Nvim | None = None
 _nvim_pid: int | None = None
 
+_VALID_SEVERITIES = {"ERROR", "WARN", "INFO", "HINT"}
+
 
 def _require_nvim() -> pynvim.Nvim:
     if _nvim is None:
         raise RuntimeError("Neovim is not running. Call nvim_start first.")
     return _nvim
+
+
+def _cleanup() -> None:
+    """Kill any orphaned nvim process on exit."""
+    if _nvim_pid is not None:
+        try:
+            os.kill(_nvim_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+atexit.register(_cleanup)
 
 
 # ---------------------------------------------------------------------------
@@ -71,18 +86,34 @@ def nvim_start(
         _nvim = None
         return f"Failed to start Neovim: {e}"
 
-    _nvim_pid = _nvim.eval("getpid()")
+    try:
+        _nvim_pid = _nvim.eval("getpid()")
+    except Exception as e:
+        # Cleanup the connection if we can't get PID
+        try:
+            _nvim.command("qall!")
+        except Exception:
+            pass
+        _nvim = None
+        _nvim_pid = None
+        return f"Failed to initialize Neovim: {e}"
+
+    msg = f"Neovim started (PID {_nvim_pid})."
 
     if not clean and os.path.isdir(config):
-        _wait_for_lazy(timeout=30)
+        if not _wait_for_lazy(timeout=30):
+            msg += " Warning: lazy.nvim did not finish loading within 30s."
 
-    return f"Neovim started (PID {_nvim_pid})."
+    return msg
 
 
-def _wait_for_lazy(timeout: int = 30) -> None:
-    """Poll until lazy.nvim reports all plugins are loaded, or timeout."""
+def _wait_for_lazy(timeout: int = 30) -> bool:
+    """Poll until lazy.nvim reports all plugins are loaded, or timeout.
+
+    Returns True if lazy loaded successfully, False on timeout.
+    """
     if _nvim is None:
-        return
+        return False
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -90,11 +121,12 @@ def _wait_for_lazy(timeout: int = 30) -> None:
                 'local ok, lazy = pcall(require, "lazy"); '
                 "if ok then return lazy.stats().loaded else return -1 end"
             )
-            if isinstance(loaded, int) and loaded > 0:
-                return
+            if isinstance(loaded, int) and loaded >= 0:
+                return True
         except pynvim.NvimError:
             pass
         time.sleep(0.5)
+    return False
 
 
 @mcp.tool()
@@ -118,13 +150,25 @@ def nvim_stop() -> str:
             os.kill(pid, 0)  # Check if alive
             os.kill(pid, signal.SIGTERM)
             time.sleep(0.5)
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.kill(pid, 0)  # Still alive after SIGTERM?
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # SIGTERM was sufficient
         except ProcessLookupError:
             pass  # Already dead
 
     _nvim = None
     _nvim_pid = None
     return "Neovim stopped."
+
+
+@mcp.tool()
+def nvim_is_running() -> str:
+    """Check if a Neovim instance is currently running."""
+    if _nvim is None:
+        return json.dumps({"running": False})
+    return json.dumps({"running": True, "pid": _nvim_pid})
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +183,11 @@ def nvim_execute(command: str) -> str:
     Args:
         command: The Ex command to run (without leading colon), e.g. "Lazy health".
     """
-    nvim = _require_nvim()
     try:
+        nvim = _require_nvim()
         output = nvim.command_output(command)
         return output if output else "(no output)"
-    except pynvim.NvimError as e:
+    except (pynvim.NvimError, RuntimeError) as e:
         return f"Error: {e}"
 
 
@@ -155,11 +199,11 @@ def nvim_lua(code: str) -> str:
         code: Lua code to execute. Use 'return' to get a value back.
               Example: "return vim.api.nvim_buf_line_count(0)"
     """
-    nvim = _require_nvim()
     try:
+        nvim = _require_nvim()
         result = nvim.exec_lua(code)
         return json.dumps(result, default=str, indent=2)
-    except pynvim.NvimError as e:
+    except (pynvim.NvimError, RuntimeError) as e:
         return f"Error: {e}"
 
 
@@ -172,15 +216,17 @@ def nvim_send_keys(keys: str, escape: bool = True) -> str:
               <C-w>, <Leader>, etc.
         escape: If True, translate special key notation via replace_termcodes.
     """
-    nvim = _require_nvim()
     try:
+        nvim = _require_nvim()
         if escape:
             keys_translated = nvim.replace_termcodes(keys, True, True, True)
         else:
             keys_translated = keys
         nvim.feedkeys(keys_translated, "n", True)
+        # Flush the input queue so keys are processed before the next tool call
+        nvim.command("")
         return f"Sent keys: {keys}"
-    except pynvim.NvimError as e:
+    except (pynvim.NvimError, RuntimeError) as e:
         return f"Error: {e}"
 
 
@@ -194,24 +240,25 @@ def nvim_get_buffer(buffer_id: int = 0) -> str:
     """Get the contents of a buffer.
 
     Args:
-        buffer_id: Buffer number. 0 means current buffer.
+        buffer_id: Buffer number (handle). 0 means current buffer.
     """
-    nvim = _require_nvim()
     try:
-        buf = nvim.current.buffer if buffer_id == 0 else nvim.buffers[buffer_id]
-        name = buf.name or "(unnamed)"
-        lines = buf[:]
+        nvim = _require_nvim()
+        if buffer_id == 0:
+            buffer_id = nvim.current.buffer.number
+        name = nvim.api.buf_get_name(buffer_id) or "(unnamed)"
+        lines = nvim.api.buf_get_lines(buffer_id, 0, -1, False)
         numbered = "\n".join(f"{i + 1:4d} | {line}" for i, line in enumerate(lines))
         return f"Buffer: {name} ({len(lines)} lines)\n{numbered}"
-    except pynvim.NvimError as e:
+    except (pynvim.NvimError, RuntimeError) as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
 def nvim_get_state() -> str:
     """Get current Neovim state: mode, cursor, file, modified, filetype, buffers, cwd."""
-    nvim = _require_nvim()
     try:
+        nvim = _require_nvim()
         state = nvim.exec_lua("""
             local bufs = {}
             for _, b in ipairs(vim.api.nvim_list_bufs()) do
@@ -234,7 +281,7 @@ def nvim_get_state() -> str:
             }
         """)
         return json.dumps(state, default=str, indent=2)
-    except pynvim.NvimError as e:
+    except (pynvim.NvimError, RuntimeError) as e:
         return f"Error: {e}"
 
 
@@ -245,13 +292,13 @@ def nvim_get_messages(clear: bool = False) -> str:
     Args:
         clear: If True, clear messages after reading.
     """
-    nvim = _require_nvim()
     try:
+        nvim = _require_nvim()
         output = nvim.command_output("messages")
         if clear:
             nvim.command("messages clear")
         return output if output.strip() else "(no messages)"
-    except pynvim.NvimError as e:
+    except (pynvim.NvimError, RuntimeError) as e:
         return f"Error: {e}"
 
 
@@ -263,8 +310,10 @@ def nvim_get_diagnostics(buffer_id: int = 0, severity: str = "") -> str:
         buffer_id: Buffer number. 0 means current buffer.
         severity: Filter by severity: "ERROR", "WARN", "INFO", "HINT", or "" for all.
     """
-    nvim = _require_nvim()
+    if severity and severity.upper() not in _VALID_SEVERITIES:
+        return f"Error: invalid severity '{severity}'. Use ERROR, WARN, INFO, or HINT."
     try:
+        nvim = _require_nvim()
         result = nvim.exec_lua(
             """
             local bufnr, sev_filter = ...
@@ -291,7 +340,7 @@ def nvim_get_diagnostics(buffer_id: int = 0, severity: str = "") -> str:
             severity,
         )
         return json.dumps(result, default=str, indent=2) if result else "No diagnostics."
-    except pynvim.NvimError as e:
+    except (pynvim.NvimError, RuntimeError) as e:
         return f"Error: {e}"
 
 

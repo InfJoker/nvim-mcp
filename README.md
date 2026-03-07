@@ -10,7 +10,7 @@ Playwright-style MCP server for Neovim. Control nvim programmatically from AI co
 
 ## Install
 
-Clone the repo and register in your Claude Code settings (`~/.claude/settings.json`):
+Clone the repo and register in `~/.claude/.mcp.json`:
 
 ```json
 {
@@ -36,6 +36,7 @@ Dependencies are managed automatically by `uv run --project`.
 |------|--------|-------------|
 | `nvim_start` | `config`, `clean`, `headless`, `args` | Start an embedded Neovim instance |
 | `nvim_stop` | — | Stop the running instance |
+| `nvim_is_running` | — | Check if an instance is running |
 
 ### Interaction
 
