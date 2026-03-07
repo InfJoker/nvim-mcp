@@ -42,9 +42,9 @@ Dependencies are managed automatically by `uv run --project`.
 
 | Tool | Params | Description |
 |------|--------|-------------|
-| `nvim_execute` | `command` | Run an Ex command, return output |
-| `nvim_lua` | `code` | Execute Lua code, return result as JSON |
-| `nvim_send_keys` | `keys`, `escape` | Send keystrokes (`<CR>`, `<Esc>`, `<C-w>`, etc.) |
+| `nvim_execute` | `command`, `timeout` | Run an Ex command, return output |
+| `nvim_lua` | `code`, `timeout` | Execute Lua code, return result as JSON |
+| `nvim_send_keys` | `keys`, `escape`, `timeout` | Send keystrokes. Falls back to PTY when RPC is blocked |
 
 ### Inspection
 
@@ -54,7 +54,8 @@ Dependencies are managed automatically by `uv run --project`.
 | `nvim_get_state` | — | Mode, cursor, file, buffers, cwd |
 | `nvim_get_messages` | `clear` | `:messages` output (error checking) |
 | `nvim_get_diagnostics` | `buffer_id`, `severity` | LSP diagnostics |
-| `nvim_screenshot` | `output_path` | Capture PNG screenshot of the terminal display |
+| `nvim_screenshot` | `output_path` | Capture PNG screenshot (works even when RPC is blocked) |
+| `nvim_health_check` | — | Comprehensive check: `:checkhealth`, `:messages`, lazy-load triggers, plugin errors, diagnostics |
 
 ## Usage Examples
 
@@ -89,6 +90,34 @@ nvim_screenshot()                         # Returns path to PNG
 nvim_send_keys("G")                       # Go to end of file
 nvim_screenshot("/tmp/bottom.png")        # Save to specific path
 nvim_stop()
+```
+
+### Health check
+
+```
+nvim_start()
+nvim_health_check()                       # Runs :checkhealth, triggers lazy-loaded
+                                          # plugins, reports all errors in one call
+nvim_stop()
+```
+
+### Recovering from blocked RPC
+
+When interactive UI (Telescope, ToggleTerm, etc.) blocks RPC:
+
+```
+nvim_screenshot()                         # Still works — captures current screen
+nvim_send_keys("<Esc>", timeout=2.0)      # Falls back to PTY write automatically
+nvim_send_keys("<C-c>", timeout=2.0)      # Ctrl-C via PTY to break out
+```
+
+### Leader key
+
+`<Leader>` is a vim mapping concept, not a raw key code. Send the actual leader key:
+
+```
+nvim_send_keys("<Space>e")                # <leader>e when leader is Space
+nvim_send_keys("<Space>ff")               # <leader>ff
 ```
 
 ## Testing

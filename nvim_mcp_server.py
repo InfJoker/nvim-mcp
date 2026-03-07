@@ -50,6 +50,8 @@ _READER_PAUSE_TIMEOUT = 0.5
 _ADAPTIVE_STARTUP_TIMEOUT = 15.0
 _ADAPTIVE_STARTUP_POLL_INTERVAL = 0.2
 _RPC_POLL_TIMEOUT = 0.5
+_RPC_DEFAULT_TIMEOUT = 10.0
+_RPC_FLUSH_TIMEOUT = 1.0
 _MAX_TERMINAL_SIZE = 500
 
 _VALID_SEVERITIES = {"ERROR", "WARN", "INFO", "HINT"}
@@ -445,6 +447,20 @@ def _with_drained_pty(s: NvimSession, quiet_ms: int = _DRAIN_QUIET_MS):
         yield
     finally:
         s.pty_reader_active.set()
+
+
+def _pty_send_raw(s: NvimSession, data: bytes) -> bool:
+    """Write raw bytes directly to the PTY master fd, bypassing RPC.
+
+    Returns True if the write succeeded, False otherwise.
+    """
+    if s.pty_master_fd is None:
+        return False
+    try:
+        os.write(s.pty_master_fd, data)
+        return True
+    except OSError:
+        return False
 
 
 def _wait_for_socket(path: str, timeout: float = _SOCKET_CONNECT_TIMEOUT) -> NvimRPC | None:
@@ -879,56 +895,149 @@ def nvim_is_running() -> str:
 
 
 @mcp.tool()
-def nvim_execute(command: str) -> str:
+def nvim_execute(command: str, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
     """Execute an Ex command in Neovim and return its output.
 
     Args:
         command: The Ex command to run (without leading colon), e.g. "Lazy health".
+        timeout: RPC timeout in seconds. Increase for slow commands (e.g. Lazy sync).
     """
     try:
         nvim = _require_nvim()
-        output = nvim.command_output(command)
-        return output if output else "(no output)"
+        prev_timeout = None
+        if isinstance(nvim, NvimRPC) and timeout != _RPC_DEFAULT_TIMEOUT:
+            prev_timeout = _SOCKET_CONNECT_TIMEOUT
+            nvim.set_timeout(timeout)
+        try:
+            output = nvim.command_output(command)
+            return output if output else "(no output)"
+        finally:
+            if prev_timeout is not None and isinstance(nvim, NvimRPC):
+                nvim.set_timeout(prev_timeout)
     except _NVIM_ERRORS as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
-def nvim_lua(code: str) -> str:
+def nvim_lua(code: str, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
     """Execute Lua code in Neovim and return the result as JSON.
 
     Args:
         code: Lua code to execute. Use 'return' to get a value back.
               Example: "return vim.api.nvim_buf_line_count(0)"
+        timeout: RPC timeout in seconds.
     """
     try:
         nvim = _require_nvim()
-        result = nvim.exec_lua(code)
-        return json.dumps(result, default=str, indent=2)
+        prev_timeout = None
+        if isinstance(nvim, NvimRPC) and timeout != _RPC_DEFAULT_TIMEOUT:
+            prev_timeout = _SOCKET_CONNECT_TIMEOUT
+            nvim.set_timeout(timeout)
+        try:
+            result = nvim.exec_lua(code)
+            return json.dumps(result, default=str, indent=2)
+        finally:
+            if prev_timeout is not None and isinstance(nvim, NvimRPC):
+                nvim.set_timeout(prev_timeout)
     except _NVIM_ERRORS as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
-def nvim_send_keys(keys: str, escape: bool = True) -> str:
+def nvim_send_keys(keys: str, escape: bool = True, timeout: float = _RPC_DEFAULT_TIMEOUT) -> str:
     """Send keystrokes to Neovim.
+
+    Uses RPC by default. If RPC times out (e.g. nvim is blocked by a
+    floating window or terminal mode), falls back to writing raw bytes
+    through the PTY fd.
 
     Args:
         keys: Key sequence to send. Supports special keys like <CR>, <Esc>,
-              <C-w>, <Leader>, etc.
+              <C-w>, <C-c>, etc. Note: <Leader> is a vim mapping concept,
+              not a key code. Use the actual leader key instead (e.g.
+              <Space>e for <leader>e when leader is Space).
         escape: If True, translate special key notation via replace_termcodes.
+        timeout: RPC timeout in seconds. Use a short value (1-2s) when you
+                 expect nvim might be blocked.
     """
     try:
         nvim = _require_nvim()
-        if escape:
-            keys_translated = nvim.replace_termcodes(keys, True, True, True)
-        else:
-            keys_translated = keys
-        nvim.feedkeys(keys_translated, "n", True)
-        nvim.command("")
-        return f"Sent keys: {keys}"
+        prev_timeout = None
+        if isinstance(nvim, NvimRPC) and timeout != _RPC_DEFAULT_TIMEOUT:
+            prev_timeout = _SOCKET_CONNECT_TIMEOUT
+            nvim.set_timeout(timeout)
+        try:
+            if escape:
+                keys_translated = nvim.replace_termcodes(keys, True, True, True)
+            else:
+                keys_translated = keys
+            nvim.feedkeys(keys_translated, "n", True)
+            nvim.command("")
+            return f"Sent keys: {keys}"
+        except _NVIM_ERRORS:
+            # RPC blocked — fall back to PTY raw write
+            if _session and _session.pty_master_fd is not None:
+                # Translate common special keys for PTY
+                raw = _keys_to_raw(keys)
+                if _pty_send_raw(_session, raw):
+                    return f"Sent keys via PTY (RPC was blocked): {keys}"
+            raise
+        finally:
+            if prev_timeout is not None and isinstance(nvim, NvimRPC):
+                nvim.set_timeout(prev_timeout)
     except _NVIM_ERRORS as e:
         return f"Error: {e}"
+
+
+# Map of special key names to their raw byte equivalents for PTY fallback
+_RAW_KEY_MAP = {
+    "<Esc>": b"\x1b",
+    "<CR>": b"\r",
+    "<C-c>": b"\x03",
+    "<C-[>": b"\x1b",
+    "<C-]>": b"\x1d",
+    "<C-\\>": b"\x1c",
+    "<C-w>": b"\x17",
+    "<C-a>": b"\x01",
+    "<C-b>": b"\x02",
+    "<C-d>": b"\x04",
+    "<C-e>": b"\x05",
+    "<C-f>": b"\x06",
+    "<C-g>": b"\x07",
+    "<C-h>": b"\x08",
+    "<C-j>": b"\x0a",
+    "<C-k>": b"\x0b",
+    "<C-l>": b"\x0c",
+    "<C-n>": b"\x0e",
+    "<C-o>": b"\x0f",
+    "<C-p>": b"\x10",
+    "<C-r>": b"\x12",
+    "<C-t>": b"\x14",
+    "<C-u>": b"\x15",
+    "<C-v>": b"\x16",
+    "<C-x>": b"\x18",
+    "<C-z>": b"\x1a",
+    "<Tab>": b"\t",
+    "<BS>": b"\x7f",
+    "<Space>": b" ",
+}
+
+_SPECIAL_KEY_RE = re.compile(r"(<[^>]+>)")
+
+
+def _keys_to_raw(keys: str) -> bytes:
+    """Convert key notation string to raw bytes for PTY write."""
+    parts = _SPECIAL_KEY_RE.split(keys)
+    result = b""
+    for part in parts:
+        if part in _RAW_KEY_MAP:
+            result += _RAW_KEY_MAP[part]
+        elif part.startswith("<") and part.endswith(">"):
+            # Unknown special key — skip it
+            pass
+        else:
+            result += part.encode("utf-8")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1049,16 +1158,27 @@ def nvim_get_diagnostics(buffer_id: int = 0, severity: str = "") -> str:
 def nvim_screenshot(output_path: str = "") -> str:
     """Capture a PNG screenshot of the current Neovim terminal display.
 
+    Works even when RPC is blocked (e.g. by Telescope or ToggleTerm).
+    The screenshot shows whatever is currently rendered in the terminal.
+
     Args:
         output_path: File path for the PNG. If empty, uses a temp file.
     """
     try:
-        nvim = _require_nvim()
+        _require_nvim()
         if _session.pyte_screen is None:
             return "Error: screenshot not available (nvim started in headless mode)"
         s = _session
-        # RPC round-trip to flush pending commands, then drain PTY until quiet.
-        nvim.eval("1")
+        # Try RPC flush with short timeout; proceed with screenshot regardless
+        if isinstance(s.nvim, NvimRPC):
+            s.nvim.set_timeout(_RPC_FLUSH_TIMEOUT)
+        try:
+            s.nvim.eval("1")
+        except _NVIM_ERRORS:
+            pass  # RPC blocked — screenshot from current PTY state anyway
+        finally:
+            if isinstance(s.nvim, NvimRPC):
+                s.nvim.set_timeout(_SOCKET_CONNECT_TIMEOUT)
         with _with_drained_pty(s, quiet_ms=_DRAIN_QUIET_MS):
             if not output_path:
                 f = tempfile.NamedTemporaryFile(
@@ -1069,6 +1189,125 @@ def nvim_screenshot(output_path: str = "") -> str:
             with s.pty_lock:
                 _render_screen_to_png(s.pyte_screen, output_path)
         return os.path.abspath(output_path)
+    except _NVIM_ERRORS as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def nvim_health_check() -> str:
+    """Comprehensive config health check.
+
+    Runs nvim's built-in :checkhealth, checks :messages for startup errors,
+    triggers lazy-loaded plugins by opening a scratch buffer (fires FileType
+    autocommands), then reports all errors and plugin statuses. This catches
+    errors that only surface when lazy-loaded plugins are activated.
+    """
+    try:
+        nvim = _require_nvim()
+
+        issues: list[str] = []
+
+        # 1. Check startup messages
+        startup_msgs = nvim.command_output("messages").strip()
+        if startup_msgs:
+            issues.append(f"[startup messages]\n{startup_msgs}")
+
+        # 2. Run nvim's built-in :checkhealth and extract warnings/errors
+        try:
+            nvim.command("messages clear")
+            nvim.command("checkhealth")
+            time.sleep(1.5)  # checkhealth can be slow
+            health_lines = nvim.api.buf_get_lines(
+                nvim.current.buffer.number, 0, -1, False
+            )
+            health_issues = [
+                line for line in health_lines
+                if line.strip().startswith(("- ERROR", "- WARNING"))
+            ]
+            if health_issues:
+                issues.append(
+                    f"[:checkhealth] {len(health_issues)} issue(s):\n"
+                    + "\n".join(health_issues[:20])
+                )
+            nvim.command("bdelete!")
+            nvim.command("messages clear")
+        except _NVIM_ERRORS:
+            pass
+
+        # 3. Open a scratch Lua buffer to trigger FileType autocommands
+        #    which lazy-load plugins like LuaSnip, nvim-cmp, etc.
+        try:
+            nvim.command("enew | setlocal buftype=nofile filetype=lua")
+            time.sleep(0.5)
+        except _NVIM_ERRORS:
+            pass
+
+        # 4. Check messages again after lazy-load triggers
+        post_msgs = nvim.command_output("messages").strip()
+        if post_msgs and post_msgs != startup_msgs:
+            new_msgs = post_msgs[len(startup_msgs):].strip() if startup_msgs else post_msgs
+            if new_msgs:
+                issues.append(f"[lazy-load messages]\n{new_msgs}")
+
+        # 5. Check plugin statuses via lazy.nvim
+        plugin_report = nvim.exec_lua("""
+            local ok, lazy_config = pcall(require, "lazy.core.config")
+            if not ok then return { has_lazy = false } end
+            local results = { has_lazy = true, plugins = {} }
+            for name, plugin in pairs(lazy_config.plugins) do
+                results.plugins[name] = {
+                    loaded = plugin._.loaded ~= nil,
+                    has_errors = plugin._.has_errors or false,
+                }
+            end
+            local stats = require("lazy").stats()
+            results.loaded = stats.loaded
+            results.count = stats.count
+            return results
+        """)
+
+        error_plugins = []
+        if isinstance(plugin_report, dict) and plugin_report.get("has_lazy"):
+            plugins = plugin_report.get("plugins", {})
+            for name, info in plugins.items():
+                if isinstance(info, dict) and info.get("has_errors"):
+                    error_plugins.append(name)
+
+        if error_plugins:
+            issues.append(f"[plugins with errors] {', '.join(sorted(error_plugins))}")
+
+        # 6. Check diagnostics across loaded buffers
+        diag_summary = nvim.exec_lua("""
+            local all = vim.diagnostic.get()
+            if #all == 0 then return nil end
+            local by_sev = {}
+            for _, d in ipairs(all) do
+                local sev = vim.diagnostic.severity[d.severity] or "?"
+                by_sev[sev] = (by_sev[sev] or 0) + 1
+            end
+            return by_sev
+        """)
+
+        if diag_summary and isinstance(diag_summary, dict):
+            parts = [f"{sev}: {count}" for sev, count in diag_summary.items()]
+            issues.append(f"[diagnostics] {', '.join(parts)}")
+
+        # 7. Close scratch buffer
+        try:
+            nvim.command("bdelete!")
+        except _NVIM_ERRORS:
+            pass
+
+        # Build report
+        if isinstance(plugin_report, dict) and plugin_report.get("has_lazy"):
+            header = f"Plugins: {plugin_report.get('loaded', '?')}/{plugin_report.get('count', '?')} loaded"
+        else:
+            header = "No lazy.nvim detected"
+
+        if not issues:
+            return f"Health check passed. {header}. No errors."
+
+        return f"Health check: {len(issues)} issue(s) found. {header}.\n\n" + "\n\n".join(issues)
     except _NVIM_ERRORS as e:
         return f"Error: {e}"
 

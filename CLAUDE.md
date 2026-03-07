@@ -58,6 +58,15 @@ Always use `_with_drained_pty` context manager — never call `_drain_pty` direc
 - `pynvim.attach("child")` doesn't accept an `env` parameter. Must temporarily modify `os.environ` in a `try/finally` block.
 - `NvimRPC` exposes only the API surface used in this file. When adding new tool functions that need additional nvim API calls, add corresponding methods to `NvimRPC`.
 
+### RPC Timeout and PTY Fallback
+
+Interactive UI (Telescope, ToggleTerm, floating windows) blocks RPC because nvim enters input mode in the floating window and stops processing RPC messages. The server handles this with:
+
+1. **Configurable `timeout` parameter** on `nvim_execute`, `nvim_lua`, `nvim_send_keys` — defaults to `_RPC_DEFAULT_TIMEOUT` (10s).
+2. **PTY fallback in `nvim_send_keys`** — when RPC times out, automatically writes raw bytes to the PTY fd via `_pty_send_raw`. This lets `<Esc>` and `<C-c>` dismiss floating windows even when RPC is frozen.
+3. **Resilient `nvim_screenshot`** — tries RPC flush with short timeout (`_RPC_FLUSH_TIMEOUT`), but proceeds with screenshot regardless. The pyte screen always has the current terminal state.
+4. **`_keys_to_raw` helper** — translates key notation (`<Esc>`, `<C-c>`, `<CR>`, etc.) to raw bytes for PTY writes. Uses `_RAW_KEY_MAP` dict and `_SPECIAL_KEY_RE` regex.
+
 ### Process Management
 
 nvim 0.10+ spawns a UI client (parent) + server child. To kill both:
