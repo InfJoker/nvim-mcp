@@ -34,7 +34,7 @@ Dependencies are managed automatically by `uv run --project`.
 
 | Tool | Params | Description |
 |------|--------|-------------|
-| `nvim_start` | `config`, `clean`, `headless`, `args` | Start an embedded Neovim instance |
+| `nvim_start` | `config`, `clean`, `headless`, `args`, `rows`, `cols` | Start a Neovim instance (PTY+socket by default, headless optional) |
 | `nvim_stop` | — | Stop the running instance |
 | `nvim_is_running` | — | Check if an instance is running |
 
@@ -54,6 +54,7 @@ Dependencies are managed automatically by `uv run --project`.
 | `nvim_get_state` | — | Mode, cursor, file, buffers, cwd |
 | `nvim_get_messages` | `clear` | `:messages` output (error checking) |
 | `nvim_get_diagnostics` | `buffer_id`, `severity` | LSP diagnostics |
+| `nvim_screenshot` | `output_path` | Capture PNG screenshot of the terminal display |
 
 ## Usage Examples
 
@@ -79,6 +80,25 @@ nvim_get_diagnostics()                    # Check for LSP errors
 nvim_stop()
 ```
 
+### Visual inspection with screenshots
+
+```
+nvim_start(rows=40, cols=120)             # Start with larger terminal
+nvim_execute("edit ~/.config/nvim/init.lua")
+nvim_screenshot()                         # Returns path to PNG
+nvim_send_keys("G")                       # Go to end of file
+nvim_screenshot("/tmp/bottom.png")        # Save to specific path
+nvim_stop()
+```
+
+## Testing
+
+```bash
+uv run python tests/test_smoke.py              # PTY mode with full config
+uv run python tests/test_smoke.py --clean      # PTY mode, no config
+uv run python tests/test_smoke.py --headless --clean  # Headless mode
+```
+
 ## How It Works
 
-Embeds Neovim via `nvim --embed --headless` and connects through pynvim's RPC interface. All interaction happens through Neovim's API — no terminal/UI scraping.
+By default, spawns Neovim in a PTY with `--listen <socket>` and connects via pynvim's socket RPC. A background `pyte` virtual terminal captures the TUI output, enabling PNG screenshots via Pillow. Pass `headless=True` to use the lighter `--embed --headless` mode (no screenshot support).
