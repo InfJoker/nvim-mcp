@@ -52,6 +52,7 @@ _ADAPTIVE_STARTUP_POLL_INTERVAL = 0.2
 _RPC_POLL_TIMEOUT = 0.5
 _RPC_DEFAULT_TIMEOUT = 10.0
 _RPC_FLUSH_TIMEOUT = 1.0
+_HEALTH_CHECK_TIMEOUT = 30.0
 _MAX_TERMINAL_SIZE = 500
 
 _VALID_SEVERITIES = {"ERROR", "WARN", "INFO", "HINT"}
@@ -493,8 +494,12 @@ def _require_nvim() -> pynvim.Nvim | NvimRPC:
 
 @contextlib.contextmanager
 def _rpc_timeout(nvim: pynvim.Nvim | NvimRPC, timeout: float):
-    """Temporarily override RPC timeout for NvimRPC connections."""
-    if isinstance(nvim, NvimRPC) and timeout != _RPC_DEFAULT_TIMEOUT:
+    """Temporarily override RPC timeout for NvimRPC connections.
+
+    Saves and restores the previous timeout via ``get_timeout()``.
+    No-op for pynvim (headless) connections.
+    """
+    if isinstance(nvim, NvimRPC):
         prev = nvim.get_timeout()
         nvim.set_timeout(timeout)
         try:
@@ -1197,16 +1202,22 @@ def _check_startup_messages(nvim: pynvim.Nvim | NvimRPC) -> str | None:
 
 
 def _run_checkhealth(nvim: pynvim.Nvim | NvimRPC) -> str | None:
-    """Run :checkhealth and return ERROR/WARNING lines, or None."""
+    """Run :checkhealth and return ERROR/WARNING lines, or None.
+
+    Uses a generous timeout since :checkhealth is synchronous but can be
+    slow (2-5s with many providers).
+    """
     try:
         nvim.command("messages clear")
-        nvim.command("checkhealth")
+        with _rpc_timeout(nvim, _HEALTH_CHECK_TIMEOUT):
+            nvim.command("checkhealth")
         health_lines = nvim.api.buf_get_lines(
             nvim.current.buffer.number, 0, -1, False
         )
         health_issues = [
             line for line in health_lines
-            if line.strip().startswith(("- ERROR", "- WARNING"))
+            if "ERROR" in line and line.strip().startswith("-")
+            or "WARNING" in line and line.strip().startswith("-")
         ]
         nvim.command("bdelete!")
         nvim.command("messages clear")

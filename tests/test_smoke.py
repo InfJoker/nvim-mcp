@@ -67,6 +67,7 @@ def main() -> int:
         nvim_get_diagnostics,
         nvim_get_messages,
         nvim_get_state,
+        nvim_health_check,
         nvim_is_running,
         nvim_lua,
         nvim_screenshot,
@@ -130,6 +131,10 @@ def main() -> int:
         check("buffer after edit", buf, ok=lambda r: "nvim_mcp_server" in r.lower())
     else:
         check("buffer after edit (autocommand)", "skipped")
+
+    # -- health check ------------------------------------------------------
+    print("health check")
+    check("health_check", nvim_health_check(), ok=lambda r: "Error" not in r)
 
     # -- screenshot --------------------------------------------------------
     print("screenshot")
