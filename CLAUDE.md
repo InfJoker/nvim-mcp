@@ -65,7 +65,9 @@ Interactive UI (Telescope, ToggleTerm, floating windows) blocks RPC because nvim
 1. **Configurable `timeout` parameter** on `nvim_execute`, `nvim_lua`, `nvim_send_keys` — defaults to `_RPC_DEFAULT_TIMEOUT` (10s).
 2. **PTY fallback in `nvim_send_keys`** — when RPC times out, automatically writes raw bytes to the PTY fd via `_pty_send_raw`. This lets `<Esc>` and `<C-c>` dismiss floating windows even when RPC is frozen.
 3. **Resilient `nvim_screenshot`** — tries RPC flush with short timeout (`_RPC_FLUSH_TIMEOUT`), but proceeds with screenshot regardless. The pyte screen always has the current terminal state.
-4. **`_keys_to_raw` helper** — translates key notation (`<Esc>`, `<C-c>`, `<CR>`, etc.) to raw bytes for PTY writes. Uses `_RAW_KEY_MAP` dict and `_SPECIAL_KEY_RE` regex.
+4. **`_keys_to_raw` helper** — translates key notation (`<Esc>`, `<C-c>`, `<CR>`, etc.) to raw bytes for PTY writes. Case-insensitive (`<cr>` = `<CR>`). Uses `_RAW_KEY_MAP` dict (uppercase keys) and `_SPECIAL_KEY_RE` regex.
+5. **`_rpc_timeout` context manager** — temporarily overrides RPC timeout, restoring the actual previous value via `NvimRPC.get_timeout()`. Used by all interaction tools and `nvim_screenshot`.
+6. **`nvim_health_check`** — decomposed into 5 helpers: `_check_startup_messages`, `_run_checkhealth`, `_trigger_lazy_plugins`, `_check_plugin_errors`, `_check_diagnostics`. Each manages its own buffer cleanup.
 
 ### Process Management
 
