@@ -27,7 +27,8 @@ Single-file server (`nvim_mcp_server.py`) using FastMCP. Three operating modes:
 | `_wait_for_lazy` | Polls lazy.nvim load status. Sends `\r` via PTY or RPC input during loading. |
 | `_start_terminal` | Launches terminal emulator with nvim, connects RPC, discovers window ID. |
 | `_screenshot_terminal` | Captures terminal window via `screencapture -l <window_id>` (macOS). |
-| `_find_window_id` | Finds macOS CGWindowID by title via Quartz/osascript (polls with timeout). |
+| `_find_window_id` | Finds macOS CGWindowID by PID or title via Quartz/osascript (polls with timeout). |
+| `_find_kitty_window_id` | Gets CGWindowID from kitty via `kitten @ ls` remote control (no macOS permissions needed). |
 | `_get_window_owner_pid` | Returns PID of a CGWindowID's owner via Quartz (`kCGWindowListOptionIncludingWindow`). |
 | `_env_wrapped_cmd` | Wraps a command with `/usr/bin/env VAR=val` for env vars differing from `os.environ`. Used by kitty (`open -gna` loses env) and iTerm2 (AppleScript `command` string). |
 | `_teardown_terminal` | Multi-strategy terminal cleanup: process group kill (ghostty), `kitten @ quit` + PID SIGTERM (kitty), AppleScript `close window id` (iTerm2). |
@@ -102,12 +103,17 @@ Launches nvim inside a real terminal emulator. Key details:
   - iTerm2: Atomic AppleScript saves frontmost process name via System Events, creates window, captures `iterm2_window_id`, then restores focus in a `try` block after `delay _APPLESCRIPT_FOCUS_DELAY`. Focus only restored if iTerm2 actually became frontmost.
   - Ghostty: `subprocess.Popen` directly — already doesn't steal focus.
 - **Environment propagation:** `_env_wrapped_cmd` wraps nvim command with `/usr/bin/env VAR=val` for env vars that differ from `os.environ`. Needed because `open -gna` spawns via launchd (loses calling env) and iTerm2 `command` string runs in a separate shell.
-- **Window ID discovery:** `_find_window_id` polls by title (`nvim-mcp-<uuid>`) via Quartz, with osascript fallback (iterates all System Events windows). All terminals use title-based lookup.
+- **Window ID discovery:** Per-terminal strategies avoid requiring Screen Recording permission for ID lookup:
+  - Kitty: `_find_kitty_window_id` uses `kitten @ ls` via remote control socket to get `platform_window_id` (CGWindowID). No macOS permissions needed.
+  - iTerm2: `iterm2_window_id` from AppleScript `id of newWindow` is already a CGWindowID.
+  - Ghostty: `_find_window_id(pid=...)` uses Quartz PID-based lookup (works without Screen Recording).
+  - Fallback for all: `_find_window_id(title=...)` polls by title via Quartz/osascript (requires Screen Recording for `kCGWindowName`).
+  - Note: `screencapture -l <window_id>` always requires Screen Recording permission regardless of how the ID was discovered.
 - **Kitty remote control:** `--listen-on unix:<kitty_socket>` stored on `NvimSession.kitty_socket`. Used for `kitten @ quit` during teardown.
 - **Kitty PID tracking:** `NvimSession.kitty_pid` discovered at launch via `_get_window_owner_pid` (Quartz `kCGWindowListOptionIncludingWindow`). Used as SIGTERM fallback if `kitten @ quit` fails.
 - **iTerm2 window ID:** `NvimSession.iterm2_window_id` (str) captured from AppleScript `return windowId`. Used for `close window id` during teardown. Distinct from `terminal_window_id` (int, CGWindowID for screenshots).
 - **Screenshots:** `screencapture -l <window_id>` (macOS only). Linux returns "not yet supported"
-- **No new dependencies:** Uses macOS system utilities and optionally imports `Quartz`
+- **macOS dependencies:** `pyobjc-framework-Quartz` for CGWindowList APIs. Also uses system `osascript` and `screencapture`.
 
 ## Testing
 
@@ -126,6 +132,6 @@ The test exercises all tools: lifecycle, inspection, interaction, and screenshot
 
 ## Dependencies
 
-Defined in `pyproject.toml`: `mcp[cli]`, `msgpack`, `pynvim`, `pyte`, `Pillow`.
+Defined in `pyproject.toml`: `mcp[cli]`, `msgpack`, `pynvim`, `pyte`, `Pillow`, `pyobjc-framework-Quartz` (macOS only).
 
 Run with `uv run` — do not use `.venv/bin/python` directly.

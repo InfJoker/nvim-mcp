@@ -65,7 +65,7 @@ _WINDOW_ID_POLL_INTERVAL = 0.3
 _OSASCRIPT_FALLBACK_TIMEOUT = 3
 _APPLESCRIPT_FOCUS_DELAY = 0.5
 _APPLESCRIPT_LAUNCH_TIMEOUT = 15
-_KITTEN_QUIT_TIMEOUT = 5
+_KITTEN_RPC_TIMEOUT = 5
 _ITERM2_CLOSE_TIMEOUT = 5
 
 _VALID_SEVERITIES = {"ERROR", "WARN", "INFO", "HINT"}
@@ -816,6 +816,36 @@ def _get_window_owner_pid(window_id: int) -> int | None:
     return None
 
 
+def _find_kitty_window_id_once(kitty_socket: str) -> int | None:
+    """Single attempt to get CGWindowID from kitty via remote control."""
+    try:
+        kitten_bin = shutil.which("kitten") or "kitten"
+        r = subprocess.run(
+            [kitten_bin, "@", "--to", f"unix:{kitty_socket}", "ls"],
+            capture_output=True, text=True, timeout=_KITTEN_RPC_TIMEOUT,
+        )
+        if r.returncode == 0:
+            data = json.loads(r.stdout)
+            for os_win in data:
+                pwid = os_win.get("platform_window_id")
+                if pwid:
+                    return int(pwid)
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+def _find_kitty_window_id(kitty_socket: str) -> int | None:
+    """Poll kitty remote control for CGWindowID (no macOS permissions needed)."""
+    deadline = time.time() + _WINDOW_ID_POLL_TIMEOUT
+    while time.time() < deadline:
+        wid = _find_kitty_window_id_once(kitty_socket)
+        if wid is not None:
+            return wid
+        time.sleep(_WINDOW_ID_POLL_INTERVAL)
+    return None
+
+
 def _dismiss_press_enter_rpc(s: NvimSession) -> None:
     """Dismiss 'Press ENTER' prompts via nvim_input() RPC (no PTY needed)."""
     if s.nvim is None or not isinstance(s.nvim, NvimRPC):
@@ -949,10 +979,29 @@ def _start_terminal(
     _dismiss_press_enter_rpc(s)
 
     # Find window ID for screenshots (macOS only)
+    # Each terminal has a preferred method that avoids Screen Recording permission:
+    #   kitty:  kitten @ ls → platform_window_id (no permission needed)
+    #   iTerm2: AppleScript `id of window` — equals NSWindow.windowNumber which
+    #           is the CGWindowID in practice (undocumented; fallback covers breakage)
+    #   ghostty: Quartz PID-based lookup (PID/bounds available without permission).
+    #           Note: ghostty may re-parent windows to an existing server process;
+    #           if PID-based lookup returns wrong window, title fallback covers it.
+    # All fall back to Quartz title-based lookup (needs Screen Recording for title).
     if platform.system() == "Darwin":
-        s.terminal_window_id = _find_window_id(title=s.terminal_title)
-        # Discover kitty PID now (window guaranteed to exist) for SIGTERM fallback
-        if s.terminal == "kitty" and s.terminal_window_id is not None:
+        if s.terminal == "kitty" and s.kitty_socket:
+            s.terminal_window_id = _find_kitty_window_id(s.kitty_socket)
+        elif s.terminal == "iterm2" and s.iterm2_window_id:
+            if s.iterm2_window_id.isdigit():
+                s.terminal_window_id = int(s.iterm2_window_id)
+        elif s.terminal == "ghostty" and s.terminal_proc is not None:
+            s.terminal_window_id = _find_window_id(pid=s.terminal_proc.pid)
+
+        # Fallback: title-based lookup (needs Screen Recording for kCGWindowName)
+        if s.terminal_window_id is None:
+            s.terminal_window_id = _find_window_id(title=s.terminal_title)
+
+        # Discover kitty PID for SIGTERM fallback during teardown
+        if s.terminal == "kitty" and s.terminal_window_id is not None and s.kitty_pid is None:
             s.kitty_pid = _get_window_owner_pid(s.terminal_window_id)
 
     return s, None
@@ -985,7 +1034,7 @@ def _teardown_terminal(s: NvimSession) -> None:
                 kitten_bin = shutil.which("kitten") or "kitten"
                 r = subprocess.run(
                     [kitten_bin, "@", "--to", f"unix:{s.kitty_socket}", "quit"],
-                    capture_output=True, timeout=_KITTEN_QUIT_TIMEOUT,
+                    capture_output=True, timeout=_KITTEN_RPC_TIMEOUT,
                 )
                 closed = r.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
@@ -1071,7 +1120,9 @@ def _screenshot_terminal(s: NvimSession, path: str) -> str:
     if s.terminal_window_id is None:
         if platform.system() != "Darwin":
             return "Error: terminal screenshots are not yet supported on Linux."
-        return "Error: terminal window ID not found. Cannot capture screenshot."
+        return ("Error: terminal window ID not found. Cannot capture screenshot. "
+                "On macOS, grant Screen Recording permission to your terminal app "
+                "(System Settings → Privacy & Security → Screen Recording).")
 
     err = _capture_window(s.terminal_window_id, path)
     if err:
