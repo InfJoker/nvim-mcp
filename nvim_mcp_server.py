@@ -927,7 +927,9 @@ def _start_terminal(
                 f"--title={s.terminal_title}",
                 "-e",
             ] + nvim_cmd_parts
-            s.terminal_proc = subprocess.Popen(cmd, env=env, process_group=0)
+            s.terminal_proc = subprocess.Popen(
+                cmd, env=env, process_group=0, stderr=subprocess.PIPE,
+            )
 
         elif s.terminal == "iterm2":
             exe_cmd = _env_wrapped_cmd(env, nvim_cmd_parts)
@@ -971,8 +973,26 @@ def _start_terminal(
     # Connect to nvim's RPC socket
     conn = _wait_for_socket(s.socket_path, timeout=_TERMINAL_SOCKET_CONNECT_TIMEOUT)
     if conn is None:
+        # Check if terminal process exited or is stuck (ghostty has terminal_proc)
+        hint = ""
+        if s.terminal_proc is not None:
+            rc = s.terminal_proc.poll()
+            if rc is not None:
+                stderr = ""
+                try:
+                    stderr = s.terminal_proc.stderr.read().strip() if s.terminal_proc.stderr else ""
+                except Exception:
+                    pass
+                hint = f" Terminal process exited with code {rc}."
+                if stderr:
+                    hint += f" stderr: {stderr}"
+            else:
+                hint = (
+                    f" {terminal} is running but nvim did not create its RPC socket."
+                    " A macOS permission dialog may be blocking the launch."
+                )
         _teardown_terminal(s)
-        return s, f"Failed to connect to Neovim socket (timeout). Is {terminal} running?"
+        return s, f"Failed to connect to Neovim socket (timeout).{hint or f' Is {terminal} running?'}"
 
     s.nvim = conn
 
