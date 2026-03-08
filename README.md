@@ -1,6 +1,10 @@
 # nvim-mcp
 
-Playwright-style MCP server for Neovim. Control nvim programmatically from AI coding assistants (Claude Code) via MCP tools.
+MCP server that spawns and controls a Neovim instance. It lets your AI agent test your Neovim configuration — open files, run commands, execute Lua, send keystrokes, inspect buffers, and capture PNG screenshots.
+
+Three modes serve different needs. **PTY mode** runs Neovim in a pseudo-terminal with full screenshot support via terminal emulation. **Headless mode** embeds Neovim without a display, for lightweight scripting. **Terminal mode** launches Neovim inside a real GUI terminal and captures its window for screenshots.
+
+Terminal mode supports Kitty, Ghostty, and iTerm2 on macOS. Each terminal handles window discovery, focus management, and cleanup through its own strategy. Screenshots use macOS `screencapture` and require Screen Recording permission.
 
 ## Requirements
 
