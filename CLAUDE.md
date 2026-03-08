@@ -8,34 +8,53 @@ MCP server that spawns and controls a Neovim instance, exposing tools for lifecy
 
 ## Architecture
 
-Single-file server (`nvim_mcp_server.py`) using FastMCP. Three operating modes:
+Modular package (`nvim_mcp/`) with a thin entry point (`nvim_mcp_server.py`). Three operating modes:
 
 - **PTY mode** (default): Spawns nvim in a pseudo-terminal with `--listen <socket>`. Connects via raw msgpack-rpc (`NvimRPC` class). Background thread feeds PTY output into pyte for terminal emulation. Supports screenshots.
 - **Headless mode**: Uses `pynvim.attach("child", argv=["nvim", "--embed", "--headless"])`. No PTY, no screenshots. Lighter weight.
 - **Terminal mode**: Launches nvim inside a real terminal emulator (Kitty, Ghostty, iTerm2). Connects via the same NvimRPC socket. Screenshots via macOS `screencapture -l <window_id>`. No pyte — the terminal does all rendering.
 
+### Module Structure
+
+```
+nvim_mcp_server.py          # Thin entry point, re-exports tool functions + __getattr__ for _session
+nvim_mcp/
+    __init__.py              # Imports tools to register @mcp.tool() decorators
+    state.py                 # Constants, NvimRPCError, NvimSession, mcp instance, session accessors
+    rpc.py                   # NvimRPC class + _NvimAPI/_NvimCurrent/_NvimCurrentBuffer
+    rendering.py             # Color maps, font loading, _render_screen_to_png
+    pty.py                   # PTY creation/reader/drain, pyte feeding, SGR fix, _teardown, _cleanup
+    terminal.py              # Terminal launch/teardown/screenshot, window ID discovery
+    tools.py                 # All 12 @mcp.tool() functions + their private helpers
+```
+
+**Dependency DAG (no cycles):**
+`tools.py` → `state.py`, `rpc.py`, `pty.py`, `terminal.py`, `rendering.py`.
+`terminal.py` → `state.py`, `rpc.py`. `pty.py` → `state.py`, `rpc.py` (late import of `terminal._teardown_terminal` in `_cleanup`).
+`rpc.py` → `state.py`. `rendering.py` → (no intra-package imports). `state.py` → (no intra-package imports, late import of `rpc.NvimRPC` in `_rpc_timeout`).
+
 ### Key Components
 
-| Component | Purpose |
-|---|---|
-| `NvimSession` dataclass | All mutable session state (nvim connection, process, PTY fd, pyte screen, threading primitives) |
-| `NvimRPC` class | Raw msgpack-rpc client over Unix socket. Replaces pynvim for PTY mode to avoid asyncio conflicts. |
-| `_pty_reader_thread` | Background daemon thread draining PTY output into pyte. Pause/resume via `Event` objects. |
-| `_with_drained_pty` | Context manager ensuring PTY reader is paused during screenshots and resumed after. |
-| `_dismiss_press_enter` | Adaptive startup: polls RPC with short timeout, sends `\r` to dismiss prompts when blocked (PTY mode). |
-| `_dismiss_press_enter_rpc` | Same as above but sends `\r` via `nvim_input()` RPC (terminal mode — no PTY fd). |
-| `_wait_for_lazy` | Polls lazy.nvim load status. Sends `\r` via PTY or RPC input during loading. |
-| `_start_terminal` | Launches terminal emulator with nvim, connects RPC, discovers window ID. |
-| `_screenshot_terminal` | Captures terminal window via `screencapture -l <window_id>` (macOS). |
-| `_find_window_id` | Finds macOS CGWindowID by PID or title via Quartz/osascript (polls with timeout). |
-| `_find_kitty_window_id` | Gets CGWindowID from kitty via `kitten @ ls` remote control (no macOS permissions needed). |
-| `_get_window_owner_pid` | Returns PID of a CGWindowID's owner via Quartz (`kCGWindowListOptionIncludingWindow`). |
-| `_env_wrapped_cmd` | Wraps a command with `/usr/bin/env VAR=val` for env vars differing from `os.environ`. Used by kitty (`open -gna` loses env) and iTerm2 (AppleScript `command` string). |
-| `_teardown_terminal` | Multi-strategy terminal cleanup: process group kill (ghostty), `kitten @ quit` + PID SIGTERM (kitty), AppleScript `close window id` (iTerm2). |
+| Component | Module | Purpose |
+|---|---|---|
+| `NvimSession` dataclass | `state.py` | All mutable session state (nvim connection, process, PTY fd, pyte screen, threading primitives) |
+| `NvimRPC` class | `rpc.py` | Raw msgpack-rpc client over Unix socket. Replaces pynvim for PTY mode to avoid asyncio conflicts. |
+| `_pty_reader_thread` | `pty.py` | Background daemon thread draining PTY output into pyte. Pause/resume via `Event` objects. |
+| `_with_drained_pty` | `pty.py` | Context manager ensuring PTY reader is paused during screenshots and resumed after. |
+| `_dismiss_press_enter` | `pty.py` | Adaptive startup: polls RPC with short timeout, sends `\r` to dismiss prompts when blocked (PTY mode). |
+| `_dismiss_press_enter_rpc` | `terminal.py` | Same as above but sends `\r` via `nvim_input()` RPC (terminal mode — no PTY fd). |
+| `_wait_for_lazy` | `tools.py` | Polls lazy.nvim load status. Sends `\r` via PTY or RPC input during loading. |
+| `_start_terminal` | `terminal.py` | Launches terminal emulator with nvim, connects RPC, discovers window ID. |
+| `_screenshot_terminal` | `terminal.py` | Captures terminal window via `screencapture -l <window_id>` (macOS). |
+| `_find_window_id` | `terminal.py` | Finds macOS CGWindowID by PID or title via Quartz/osascript (polls with timeout). |
+| `_find_kitty_window_id` | `terminal.py` | Gets CGWindowID from kitty via `kitten @ ls` remote control (no macOS permissions needed). |
+| `_get_window_owner_pid` | `terminal.py` | Returns PID of a CGWindowID's owner via Quartz (`kCGWindowListOptionIncludingWindow`). |
+| `_env_wrapped_cmd` | `terminal.py` | Wraps a command with `/usr/bin/env VAR=val` for env vars differing from `os.environ`. |
+| `_teardown_terminal` | `terminal.py` | Multi-strategy terminal cleanup: process group kill (ghostty), `kitten @ quit` + PID SIGTERM (kitty), AppleScript `close window id` (iTerm2). |
 
-### Globals
+### Session State
 
-Single module-level mutable: `_session: NvimSession | None`. All tool functions access it via `_require_nvim()`.
+Module-level `_session: NvimSession | None` in `state.py`, accessed via `get_session()` / `set_session()`. Tool functions use `_require_nvim()` to get the active connection. `nvim_mcp_server.py` provides `__getattr__` for backward-compatible `_session` attribute access.
 
 ## Important Patterns
 
@@ -65,7 +84,7 @@ Always use `_with_drained_pty` context manager — never call `_drain_pty` direc
 
 - `pynvim.attach("socket")` uses asyncio internally, which conflicts with the PTY reader thread's `select()` calls. Use `NvimRPC` for socket connections.
 - `pynvim.attach("child")` doesn't accept an `env` parameter. Must temporarily modify `os.environ` in a `try/finally` block.
-- `NvimRPC` exposes only the API surface used in this file. When adding new tool functions that need additional nvim API calls, add corresponding methods to `NvimRPC`.
+- `NvimRPC` exposes only the API surface used in the codebase. When adding new tool functions that need additional nvim API calls, add corresponding methods to `NvimRPC` in `rpc.py`.
 
 ### RPC Timeout and PTY Fallback
 
@@ -91,7 +110,7 @@ Terminal teardown varies by launcher:
 
 ## Constants
 
-All timeout and buffer-size values are named constants at the top of the file. When tuning behavior, modify constants — don't introduce new magic numbers.
+All timeout and buffer-size values are named constants in `state.py`. When tuning behavior, modify constants — don't introduce new magic numbers.
 
 ### Terminal Mode
 
