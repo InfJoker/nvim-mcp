@@ -117,14 +117,14 @@ All timeout and buffer-size values are named constants in `state.py`. When tunin
 Launches nvim inside a real terminal emulator. Key details:
 
 - **Supported terminals:** Kitty, Ghostty, iTerm2 (macOS only)
-- **Focus steal prevention:**
-  - Kitty: `open -gna kitty.app --args ...` — macOS `-g` flag prevents activation at WindowServer level. `.app` bundle resolved from binary via `os.path.realpath`. Also passes `-o close_on_child_death=yes -o macos_quit_when_last_window_closed=yes` so kitty auto-exits when nvim stops.
-  - iTerm2: Atomic AppleScript saves frontmost process name via System Events, creates window, captures `iterm2_window_id`, then restores focus in a `try` block after `delay _APPLESCRIPT_FOCUS_DELAY`. Focus only restored if iTerm2 actually became frontmost.
-  - Ghostty: `open -na Ghostty.app --args ...` (without `-g` — Ghostty's window doesn't appear with `-g`). Uses `--command=` instead of `-e` to bypass Ghostty's v1.2.0+ execution security prompt (GHSA-q9fg-cpmh-c78x). Focus restored via pre-capture osascript after `_APPLESCRIPT_FOCUS_DELAY`.
-- **Environment propagation:** `_env_wrapped_cmd` wraps nvim command with `/usr/bin/env VAR=val` for env vars that differ from `os.environ`. Needed because `open -gna`/`open -na` spawns via launchd (loses calling env) and iTerm2 `command` string runs in a separate shell.
+- **Focus steal prevention:** All terminals use `open -na` with focus restoration via shared `_capture_frontmost_app()` / `_restore_focus()` helpers. `.app` bundle resolved from binary via `_resolve_app_bundle()`.
+  - Kitty: `open -na kitty.app --args ...`. Passes `-o close_on_child_death=yes -o macos_quit_when_last_window_closed=yes` so kitty auto-exits when nvim stops.
+  - Ghostty: `open -na Ghostty.app --args ...`. Uses `--command=` instead of `-e` to bypass v1.2.0+ execution security prompt (GHSA-q9fg-cpmh-c78x).
+  - iTerm2: Atomic AppleScript with inline focus capture/restore (not `_restore_focus` — AppleScript handles it atomically).
+- **Environment propagation:** `_env_wrapped_cmd` wraps nvim command with `/usr/bin/env VAR=val` for env vars that differ from `os.environ`. Needed because `open -na` spawns via launchd (loses calling env) and iTerm2 `command` string runs in a separate shell.
 - **Window ID discovery:** Three-tier cascade avoids Screen Recording permission where possible:
   1. Terminal-specific primary: Kitty uses `kitten @ ls` (needs `allow_remote_control`). iTerm2 uses AppleScript `id of newWindow` (CGWindowID).
-  2. Diff-based fallback (all terminals): `_find_new_window_id` snapshots window IDs before launch (`windows_before`), finds the new one via `kCGWindowOwnerName`. No permissions needed. Owner names: kitty=`"kitty"`, ghostty=`"Ghostty"`, iTerm2=`"iTerm"`.
+  2. Diff-based fallback (all terminals): `_find_new_window_id` snapshots window IDs before launch (`windows_before`), finds the new one via `kCGWindowOwnerName`. Prefers title match (`kCGWindowName`, needs Screen Recording) to avoid kitty helper windows; falls back to highest ID. Polls until title appears or timeout.
   3. Title-based last resort: `_find_window_id(title=...)` polls via Quartz/osascript (requires Screen Recording for `kCGWindowName`).
   - Note: `screencapture -l <window_id>` always requires Screen Recording permission regardless of how the ID was discovered.
 - **Kitty remote control:** `--listen-on unix:<kitty_socket>` stored on `NvimSession.kitty_socket`. Used for `kitten @ quit` during teardown.

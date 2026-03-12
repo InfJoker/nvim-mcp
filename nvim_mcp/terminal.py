@@ -118,28 +118,12 @@ def _find_new_window_id(
 ) -> int | None:
     """Poll for a new window owned by *owner_name* that wasn't in *before*.
 
-    If *title* is given and Screen Recording is available, prefer the window
-    whose kCGWindowName matches (avoids picking kitty helper windows).
-    Falls back to highest ID.
-    """
-    deadline = time.time() + _WINDOW_ID_POLL_TIMEOUT
-    while time.time() < deadline:
-        current = _list_window_ids(owner_name)
-        new_ids = current - before
-        if new_ids:
-            if title:
-                titled = _find_titled_window(new_ids, title)
-                if titled is not None:
-                    return titled
-            return max(new_ids)
-        time.sleep(_WINDOW_ID_POLL_INTERVAL)
-    return None
+    If *title* is given, prefer the window whose kCGWindowName matches
+    (avoids picking kitty helper windows). Requires Screen Recording for
+    title matching; falls back to highest ID without it.
 
-
-def _find_titled_window(window_ids: set[int], title: str) -> int | None:
-    """Return the window ID whose kCGWindowName contains *title*, or None.
-
-    Requires Screen Recording permission; returns None silently without it.
+    Uses a single Quartz query per poll iteration (title check is done inline
+    on the same window list used for ID diffing).
     """
     try:
         from Quartz import (  # type: ignore[import-untyped]
@@ -147,17 +131,48 @@ def _find_titled_window(window_ids: set[int], title: str) -> int | None:
             kCGNullWindowID,
             kCGWindowListOptionAll,
         )
+    except ImportError:
+        return None
+
+    deadline = time.time() + _WINDOW_ID_POLL_TIMEOUT
+    fallback_id: int | None = None
+    while time.time() < deadline:
         windows = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)
+        new_ids: set[int] = set()
+        titled_id: int | None = None
         if windows:
             for win in windows:
+                if win.get("kCGWindowOwnerName") != owner_name:
+                    continue
                 wid = win.get("kCGWindowNumber")
-                if wid and int(wid) in window_ids:
+                if not wid:
+                    continue
+                wid_int = int(wid)
+                if wid_int in before:
+                    continue
+                # Skip zero-size helper windows
+                bounds = win.get("kCGWindowBounds")
+                if bounds:
+                    w = bounds.get("Width", 0)
+                    h = bounds.get("Height", 0)
+                    if w == 0 and h == 0:
+                        continue
+                new_ids.add(wid_int)
+                # Title match (needs Screen Recording for kCGWindowName)
+                if title and titled_id is None:
                     name = win.get("kCGWindowName")
                     if name and title in str(name):
-                        return int(wid)
-    except ImportError:
-        pass
-    return None
+                        titled_id = wid_int
+        if titled_id is not None:
+            return titled_id
+        if new_ids:
+            # Remember fallback but keep polling for title match — the
+            # terminal may not have set the window title yet.
+            fallback_id = max(new_ids)
+            if not title:
+                return fallback_id
+        time.sleep(_WINDOW_ID_POLL_INTERVAL)
+    return fallback_id
 
 
 def _find_window_id(pid: int | None = None, title: str | None = None) -> int | None:
@@ -416,8 +431,6 @@ def _start_terminal(
                 "-o", "macos_quit_when_last_window_closed=yes",
                 "-e",
             ] + exe_cmd
-            # Use `open -na` (not -gna): the -g flag can prevent the window
-            # from rendering content, causing black screenshots.
             prev_app = _capture_frontmost_app()
             subprocess.Popen(["open", "-na", kitty_app, "--args"] + kitty_args)
             _restore_focus("kitty", prev_app)
