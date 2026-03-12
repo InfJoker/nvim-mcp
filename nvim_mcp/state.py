@@ -89,6 +89,8 @@ class NvimSession:
     terminal_title: str | None = None
     kitty_socket: str | None = None
     kitty_pid: int | None = None
+    ghostty_pid: int | None = None
+    ghostty_windows_before: set[int] | None = None
     iterm2_window_id: str | None = None
 
 
