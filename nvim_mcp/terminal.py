@@ -331,7 +331,7 @@ def _start_terminal(
                 ghostty_app = "/Applications/Ghostty.app"
             else:
                 return s, "Cannot locate Ghostty.app bundle (needed for background launch)"
-            # Use --initial-command instead of -e to avoid Ghostty's v1.2.0+
+            # Use --command= (config key) instead of -e to avoid Ghostty's v1.2.0+
             # "Allow Ghostty to Execute" security prompt (GHSA-q9fg-cpmh-c78x).
             # Config-based commands are trusted; -e commands always prompt.
             exe_cmd = _env_wrapped_cmd(env, nvim_cmd_parts)
