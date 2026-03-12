@@ -20,6 +20,8 @@ from nvim_mcp.state import (
     _ADAPTIVE_STARTUP_TIMEOUT,
     _APPLESCRIPT_FOCUS_DELAY,
     _APPLESCRIPT_LAUNCH_TIMEOUT,
+    _BLANK_SCREENSHOT_THRESHOLD,
+    _FRONTMOST_APP_TIMEOUT,
     _ITERM2_CLOSE_TIMEOUT,
     _KITTEN_RPC_TIMEOUT,
     _NVIM_ERRORS,
@@ -27,8 +29,10 @@ from nvim_mcp.state import (
     _PROCESS_KILL_TIMEOUT,
     _PROCESS_TERM_TIMEOUT,
     _RPC_POLL_TIMEOUT,
+    _SCREENCAPTURE_TIMEOUT,
     _SOCKET_CONNECT_TIMEOUT,
     _TERMINAL_NAMES,
+    _TERMINAL_OWNER_NAMES,
     _TERMINAL_SOCKET_CONNECT_TIMEOUT,
     _WINDOW_ID_POLL_INTERVAL,
     _WINDOW_ID_POLL_TIMEOUT,
@@ -46,25 +50,24 @@ def _check_terminal_available(terminal: str) -> str | None:
     if terminal not in _TERMINAL_NAMES:
         return f"Unknown terminal '{terminal}'. Supported: {', '.join(sorted(_TERMINAL_NAMES))}"
 
+    if platform.system() != "Darwin":
+        return "Terminal mode is only supported on macOS."
+
     if terminal == "iterm2":
-        if platform.system() != "Darwin":
-            return "iTerm2 is only available on macOS."
         # Check for app bundle
         if not os.path.isdir("/Applications/iTerm.app"):
             return "iTerm2 not found at /Applications/iTerm.app"
         return None
 
-    # kitty and ghostty — check via shutil.which
+    # kitty and ghostty — check via shutil.which or macOS app bundle path
     if shutil.which(terminal) is None:
-        # Also check macOS app bundle paths
-        if platform.system() == "Darwin":
-            app_paths = {
-                "kitty": "/Applications/kitty.app/Contents/MacOS/kitty",
-                "ghostty": "/Applications/Ghostty.app/Contents/MacOS/ghostty",
-            }
-            path = app_paths.get(terminal)
-            if path and os.path.isfile(path):
-                return None
+        app_paths = {
+            "kitty": "/Applications/kitty.app/Contents/MacOS/kitty",
+            "ghostty": "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+        }
+        path = app_paths.get(terminal)
+        if path and os.path.isfile(path):
+            return None
         return f"'{terminal}' not found in PATH. Install it first."
     return None
 
@@ -79,6 +82,7 @@ def _list_window_ids(owner_name: str) -> set[int]:
 
     Uses kCGWindowListOptionAll because windows launched in the background
     (via ``open -na`` / ``open -gna``) may not appear in the on-screen-only list.
+    Excludes zero-size helper windows (e.g. kitty's status bar windows).
     """
     ids: set[int] = set()
     try:
@@ -94,22 +98,65 @@ def _list_window_ids(owner_name: str) -> set[int]:
             for win in windows:
                 if win.get("kCGWindowOwnerName") == owner_name:
                     wid = win.get("kCGWindowNumber")
-                    if wid:
-                        ids.add(int(wid))
+                    if not wid:
+                        continue
+                    # Skip zero-size helper windows
+                    bounds = win.get("kCGWindowBounds")
+                    if bounds:
+                        w = bounds.get("Width", 0)
+                        h = bounds.get("Height", 0)
+                        if w == 0 and h == 0:
+                            continue
+                    ids.add(int(wid))
     except ImportError:
         pass
     return ids
 
 
-def _find_new_window_id(owner_name: str, before: set[int]) -> int | None:
-    """Poll for a new window owned by *owner_name* that wasn't in *before*."""
+def _find_new_window_id(
+    owner_name: str, before: set[int], title: str | None = None,
+) -> int | None:
+    """Poll for a new window owned by *owner_name* that wasn't in *before*.
+
+    If *title* is given and Screen Recording is available, prefer the window
+    whose kCGWindowName matches (avoids picking kitty helper windows).
+    Falls back to highest ID.
+    """
     deadline = time.time() + _WINDOW_ID_POLL_TIMEOUT
     while time.time() < deadline:
         current = _list_window_ids(owner_name)
         new_ids = current - before
         if new_ids:
-            return max(new_ids)  # highest ID = most recently created
+            if title:
+                titled = _find_titled_window(new_ids, title)
+                if titled is not None:
+                    return titled
+            return max(new_ids)
         time.sleep(_WINDOW_ID_POLL_INTERVAL)
+    return None
+
+
+def _find_titled_window(window_ids: set[int], title: str) -> int | None:
+    """Return the window ID whose kCGWindowName contains *title*, or None.
+
+    Requires Screen Recording permission; returns None silently without it.
+    """
+    try:
+        from Quartz import (  # type: ignore[import-untyped]
+            CGWindowListCopyWindowInfo,
+            kCGNullWindowID,
+            kCGWindowListOptionAll,
+        )
+        windows = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)
+        if windows:
+            for win in windows:
+                wid = win.get("kCGWindowNumber")
+                if wid and int(wid) in window_ids:
+                    name = win.get("kCGWindowName")
+                    if name and title in str(name):
+                        return int(wid)
+    except ImportError:
+        pass
     return None
 
 
@@ -265,6 +312,55 @@ def _dismiss_press_enter_rpc(s: NvimSession) -> None:
     s.nvim.set_timeout(_SOCKET_CONNECT_TIMEOUT)
 
 
+def _resolve_app_bundle(binary: str, default_app: str) -> str | None:
+    """Resolve macOS .app bundle path from a binary path or default location.
+
+    Returns the .app path, or None if not found.
+    """
+    real = os.path.realpath(binary)
+    if ".app/" in real:
+        return real[:real.index(".app/") + 4]
+    if os.path.isdir(default_app):
+        return default_app
+    return None
+
+
+def _capture_frontmost_app() -> str:
+    """Return the name of the current frontmost macOS app, or empty string."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of first process'
+             ' whose frontmost is true'],
+            capture_output=True, text=True, timeout=_FRONTMOST_APP_TIMEOUT,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
+
+
+def _restore_focus(terminal_process_name: str, prev_app: str) -> None:
+    """Fire-and-forget: restore focus if the terminal stole it."""
+    if not prev_app:
+        return
+    try:
+        subprocess.Popen(
+            ["osascript", "-e",
+             f'delay {_APPLESCRIPT_FOCUS_DELAY}\n'
+             f'tell application "System Events"\n'
+             f'  try\n'
+             f'    if frontmost of process "{terminal_process_name}" is true then\n'
+             f'      set frontmost of process "{prev_app}" to true\n'
+             f'    end if\n'
+             f'  end try\n'
+             f'end tell'],
+        )
+    except OSError:
+        pass
+
+
 def _env_wrapped_cmd(env: dict[str, str], cmd: list[str]) -> list[str]:
     """Wrap command with /usr/bin/env for vars that differ from os.environ."""
     assignments = [f"{k}={v}" for k, v in env.items() if os.environ.get(k) != v]
@@ -299,16 +395,17 @@ def _start_terminal(
     if cmd_extra:
         nvim_cmd_parts.extend(cmd_extra)
 
+    # Snapshot existing windows for diff-based window ID discovery (all terminals)
+    owner = _TERMINAL_OWNER_NAMES.get(s.terminal)
+    if owner and platform.system() == "Darwin":
+        s.windows_before = _list_window_ids(owner)
+
     try:
         if s.terminal == "kitty":
             s.kitty_socket = os.path.join(s.socket_dir, "kitty.sock")
             kitty_bin = shutil.which("kitty") or "/Applications/kitty.app/Contents/MacOS/kitty"
-            kitty_real = os.path.realpath(kitty_bin)
-            if ".app/" in kitty_real:
-                kitty_app = kitty_real[:kitty_real.index(".app/") + 4]
-            elif os.path.isdir("/Applications/kitty.app"):
-                kitty_app = "/Applications/kitty.app"
-            else:
+            kitty_app = _resolve_app_bundle(kitty_bin, "/Applications/kitty.app")
+            if kitty_app is None:
                 return s, "Cannot locate kitty.app bundle (needed for background launch)"
             exe_cmd = _env_wrapped_cmd(env, nvim_cmd_parts)
             kitty_args = [
@@ -319,17 +416,17 @@ def _start_terminal(
                 "-o", "macos_quit_when_last_window_closed=yes",
                 "-e",
             ] + exe_cmd
-            subprocess.Popen(["open", "-gna", kitty_app, "--args"] + kitty_args)
+            # Use `open -na` (not -gna): the -g flag can prevent the window
+            # from rendering content, causing black screenshots.
+            prev_app = _capture_frontmost_app()
+            subprocess.Popen(["open", "-na", kitty_app, "--args"] + kitty_args)
+            _restore_focus("kitty", prev_app)
             # No terminal_proc — kitty spawned by launchd
 
         elif s.terminal == "ghostty":
             ghostty_bin = shutil.which("ghostty") or "/Applications/Ghostty.app/Contents/MacOS/ghostty"
-            ghostty_real = os.path.realpath(ghostty_bin)
-            if ".app/" in ghostty_real:
-                ghostty_app = ghostty_real[:ghostty_real.index(".app/") + 4]
-            elif os.path.isdir("/Applications/Ghostty.app"):
-                ghostty_app = "/Applications/Ghostty.app"
-            else:
+            ghostty_app = _resolve_app_bundle(ghostty_bin, "/Applications/Ghostty.app")
+            if ghostty_app is None:
                 return s, "Cannot locate Ghostty.app bundle (needed for background launch)"
             # Use --command= (config key) instead of -e to avoid Ghostty's v1.2.0+
             # "Allow Ghostty to Execute" security prompt (GHSA-q9fg-cpmh-c78x).
@@ -340,41 +437,12 @@ def _start_terminal(
                 f"--command={shlex.join(exe_cmd)}",
                 "--quit-after-last-window-closed=true",
             ]
-            # Snapshot existing Ghostty windows before launch (for diff-based ID discovery)
-            s.ghostty_windows_before = _list_window_ids("Ghostty")
-            # Capture frontmost app before launch for focus restoration.
-            prev_app = ""
-            try:
-                r = subprocess.run(
-                    ["osascript", "-e",
-                     'tell application "System Events" to get name of first process'
-                     ' whose frontmost is true'],
-                    capture_output=True, text=True, timeout=2,
-                )
-                if r.returncode == 0:
-                    prev_app = r.stdout.strip()
-            except (subprocess.TimeoutExpired, OSError):
-                pass
             # Use `open -na` (not -gna): the -g flag prevents Ghostty's
             # window from appearing until clicked in the dock.
+            prev_app = _capture_frontmost_app()
             subprocess.Popen(["open", "-na", ghostty_app, "--args"] + ghostty_args)
+            _restore_focus("Ghostty", prev_app)
             # No terminal_proc — ghostty spawned by launchd via `open -na`
-            # Restore focus (like iTerm2 does).
-            if prev_app:
-                try:
-                    subprocess.Popen(
-                        ["osascript", "-e",
-                         f'delay {_APPLESCRIPT_FOCUS_DELAY}\n'
-                         f'tell application "System Events"\n'
-                         f'  try\n'
-                         f'    if frontmost of process "Ghostty" is true then\n'
-                         f'      set frontmost of process "{prev_app}" to true\n'
-                         f'    end if\n'
-                         f'  end try\n'
-                         f'end tell'],
-                    )
-                except OSError:
-                    pass
 
         elif s.terminal == "iterm2":
             exe_cmd = _env_wrapped_cmd(env, nvim_cmd_parts)
@@ -409,7 +477,9 @@ def _start_terminal(
             )
             if result.returncode != 0:
                 return s, f"Failed to launch iTerm2: {result.stderr.strip()}"
-            s.iterm2_window_id = result.stdout.strip() or None
+            raw_id = result.stdout.strip()
+            if raw_id and raw_id.isdigit():
+                s.iterm2_window_id = int(raw_id)
             # iTerm2 launch is async — no terminal_proc to track
 
     except Exception as e:
@@ -418,56 +488,38 @@ def _start_terminal(
     # Connect to nvim's RPC socket
     conn = _wait_for_socket(s.socket_path, timeout=_TERMINAL_SOCKET_CONNECT_TIMEOUT)
     if conn is None:
-        # Check if terminal process exited or is stuck
-        hint = ""
-        if s.terminal_proc is not None:
-            rc = s.terminal_proc.poll()
-            if rc is not None:
-                stderr = ""
-                try:
-                    stderr = s.terminal_proc.stderr.read().strip() if s.terminal_proc.stderr else ""
-                except Exception:
-                    pass
-                hint = f" Terminal process exited with code {rc}."
-                if stderr:
-                    hint += f" stderr: {stderr}"
-            else:
-                hint = (
-                    f" {terminal} is running but nvim did not create its RPC socket."
-                    " A macOS permission dialog may be blocking the launch."
-                )
         _teardown_terminal(s)
-        return s, f"Failed to connect to Neovim socket (timeout).{hint or f' Is {terminal} running?'}"
+        return s, (
+            f"Failed to connect to Neovim socket (timeout)."
+            f" Is {terminal} running? A macOS permission dialog may be blocking the launch."
+        )
 
     s.nvim = conn
 
     _dismiss_press_enter_rpc(s)
 
-    # Find window ID for screenshots (macOS only)
-    # Each terminal has a preferred method that avoids Screen Recording permission:
-    #   kitty:  kitten @ ls → platform_window_id (no permission needed)
-    #   iTerm2: AppleScript `id of window` — equals NSWindow.windowNumber which
-    #           is the CGWindowID in practice (undocumented; fallback covers breakage)
-    #   ghostty: diff-based — snapshot window IDs before launch, find the new one.
-    #           No permissions needed (kCGWindowOwnerName is always readable).
-    # All fall back to Quartz title-based lookup (needs Screen Recording for title).
+    # Find window ID for screenshots (macOS only).
+    # Three-tier cascade: terminal-specific primary → diff-based → title-based.
+    # See _TERMINAL_OWNER_NAMES for Quartz kCGWindowOwnerName mapping.
     if platform.system() == "Darwin":
         if s.terminal == "kitty" and s.kitty_socket:
             s.terminal_window_id = _find_kitty_window_id(s.kitty_socket)
-        elif s.terminal == "ghostty" and s.ghostty_windows_before is not None:
-            s.terminal_window_id = _find_new_window_id("Ghostty", s.ghostty_windows_before)
-        elif s.terminal == "iterm2" and s.iterm2_window_id:
-            if s.iterm2_window_id.isdigit():
-                s.terminal_window_id = int(s.iterm2_window_id)
-        # Fallback: title-based lookup (needs Screen Recording for kCGWindowName)
+        elif s.terminal == "iterm2" and s.iterm2_window_id is not None:
+            s.terminal_window_id = s.iterm2_window_id
+        # Diff-based fallback: works for all terminals without any permissions
+        if s.terminal_window_id is None and s.windows_before is not None:
+            if owner:
+                s.terminal_window_id = _find_new_window_id(
+                    owner, s.windows_before, title=s.terminal_title,
+                )
+        # Title-based fallback (needs Screen Recording for kCGWindowName)
         if s.terminal_window_id is None:
             s.terminal_window_id = _find_window_id(title=s.terminal_title)
 
-        # Discover owner PID for SIGTERM fallback during teardown
-        if s.terminal == "kitty" and s.terminal_window_id is not None and s.kitty_pid is None:
-            s.kitty_pid = _get_window_owner_pid(s.terminal_window_id)
-        if s.terminal == "ghostty" and s.terminal_window_id is not None and s.ghostty_pid is None:
-            s.ghostty_pid = _get_window_owner_pid(s.terminal_window_id)
+        # Discover owner PID for SIGTERM teardown (kitty, ghostty only).
+        # iTerm2 is a single process shared across all windows — never SIGTERM it.
+        if s.terminal_window_id is not None and s.terminal_pid is None and s.terminal != "iterm2":
+            s.terminal_pid = _get_window_owner_pid(s.terminal_window_id)
 
     return s, None
 
@@ -497,35 +549,31 @@ def _teardown_terminal(s: NvimSession) -> None:
                 pass
         s.terminal_proc = None
 
-    if s.terminal == "kitty" and s.terminal_proc is None:
-        closed = False
-        if s.kitty_socket:
-            try:
-                kitten_bin = shutil.which("kitten") or "kitten"
-                r = subprocess.run(
-                    [kitten_bin, "@", "--to", f"unix:{s.kitty_socket}", "quit"],
-                    capture_output=True, timeout=_KITTEN_RPC_TIMEOUT,
-                )
-                closed = r.returncode == 0
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-        # Fallback: SIGTERM the kitty process by PID (discovered at launch)
-        if not closed and s.kitty_pid is not None:
-            try:
-                os.kill(s.kitty_pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-
-    if s.terminal == "ghostty" and s.terminal_proc is None and s.ghostty_pid is not None:
+    # Kitty-specific: try graceful quit via remote control socket first
+    if s.terminal == "kitty" and s.kitty_socket:
         try:
-            os.kill(s.ghostty_pid, signal.SIGTERM)
+            kitten_bin = shutil.which("kitten") or "kitten"
+            r = subprocess.run(
+                [kitten_bin, "@", "--to", f"unix:{s.kitty_socket}", "quit"],
+                capture_output=True, timeout=_KITTEN_RPC_TIMEOUT,
+            )
+            if r.returncode == 0:
+                s.terminal_pid = None  # already quit, skip SIGTERM
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # Shared SIGTERM fallback for kitty and ghostty (NOT iTerm2 — it's a
+    # single process shared across all windows; SIGTERM would kill every window)
+    if s.terminal_pid is not None and s.terminal_proc is None and s.terminal != "iterm2":
+        try:
+            os.kill(s.terminal_pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
     if s.terminal == "iterm2":
         # Best-effort close the iTerm2 window by ID (captured at launch)
         try:
-            if s.iterm2_window_id and s.iterm2_window_id.isdigit():
+            if s.iterm2_window_id is not None:
                 script = (
                     f'tell application "iTerm2"\n'
                     f'  close window id {s.iterm2_window_id}\n'
@@ -579,14 +627,14 @@ def _capture_window(window_id: int, path: str) -> str | None:
     try:
         result = subprocess.run(
             ["screencapture", "-l", str(window_id), path],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=_SCREENCAPTURE_TIMEOUT,
         )
         if result.returncode != 0:
             return f"screencapture failed: {result.stderr.strip()}"
         # Check for blank/tiny screenshots (permissions issue)
-        if os.path.isfile(path) and os.path.getsize(path) < 500:
+        if os.path.isfile(path) and os.path.getsize(path) < _BLANK_SCREENSHOT_THRESHOLD:
             return (
-                "Screenshot appears blank (< 500 bytes). "
+                f"Screenshot appears blank (< {_BLANK_SCREENSHOT_THRESHOLD} bytes). "
                 "Check macOS Screen Recording permissions for your terminal."
             )
         return None

@@ -104,9 +104,9 @@ nvim 0.10+ spawns a UI client (parent) + server child. To kill both:
 - `os.killpg(proc.pid, signal.SIGTERM)` — kills the entire group
 
 Terminal teardown varies by launcher:
-- **Ghostty**: No `terminal_proc` (launched via `open -na`) → SIGTERM by `ghostty_pid` (discovered at launch via Quartz)
-- **Kitty**: No `terminal_proc` (launched via `open -gna`) → `kitten @ quit` via socket, then SIGTERM by `kitty_pid` (discovered at launch via Quartz) as fallback
-- **iTerm2**: No `terminal_proc` (launched via AppleScript) → `close window id` using `iterm2_window_id` (captured at launch), session-name search as fallback
+- **Kitty**: `kitten @ quit` via socket, then SIGTERM by `terminal_pid` as fallback
+- **Ghostty**: SIGTERM by `terminal_pid` (discovered at launch via Quartz)
+- **iTerm2**: AppleScript `close window id` using `iterm2_window_id` (captured at launch), session-name search as fallback. Never SIGTERM — iTerm2 is a single shared process.
 
 ## Constants
 
@@ -122,15 +122,14 @@ Launches nvim inside a real terminal emulator. Key details:
   - iTerm2: Atomic AppleScript saves frontmost process name via System Events, creates window, captures `iterm2_window_id`, then restores focus in a `try` block after `delay _APPLESCRIPT_FOCUS_DELAY`. Focus only restored if iTerm2 actually became frontmost.
   - Ghostty: `open -na Ghostty.app --args ...` (without `-g` — Ghostty's window doesn't appear with `-g`). Uses `--command=` instead of `-e` to bypass Ghostty's v1.2.0+ execution security prompt (GHSA-q9fg-cpmh-c78x). Focus restored via pre-capture osascript after `_APPLESCRIPT_FOCUS_DELAY`.
 - **Environment propagation:** `_env_wrapped_cmd` wraps nvim command with `/usr/bin/env VAR=val` for env vars that differ from `os.environ`. Needed because `open -gna`/`open -na` spawns via launchd (loses calling env) and iTerm2 `command` string runs in a separate shell.
-- **Window ID discovery:** Per-terminal strategies avoid requiring Screen Recording permission for ID lookup:
-  - Kitty: `_find_kitty_window_id` uses `kitten @ ls` via remote control socket to get `platform_window_id` (CGWindowID). No macOS permissions needed.
-  - iTerm2: `iterm2_window_id` from AppleScript `id of newWindow` is already a CGWindowID.
-  - Ghostty: `_find_new_window_id` diffs Ghostty window IDs before/after launch via `kCGWindowOwnerName` (no permissions needed).
-  - Fallback for all: `_find_window_id(title=...)` polls by title via Quartz/osascript (requires Screen Recording for `kCGWindowName`).
+- **Window ID discovery:** Three-tier cascade avoids Screen Recording permission where possible:
+  1. Terminal-specific primary: Kitty uses `kitten @ ls` (needs `allow_remote_control`). iTerm2 uses AppleScript `id of newWindow` (CGWindowID).
+  2. Diff-based fallback (all terminals): `_find_new_window_id` snapshots window IDs before launch (`windows_before`), finds the new one via `kCGWindowOwnerName`. No permissions needed. Owner names: kitty=`"kitty"`, ghostty=`"Ghostty"`, iTerm2=`"iTerm"`.
+  3. Title-based last resort: `_find_window_id(title=...)` polls via Quartz/osascript (requires Screen Recording for `kCGWindowName`).
   - Note: `screencapture -l <window_id>` always requires Screen Recording permission regardless of how the ID was discovered.
 - **Kitty remote control:** `--listen-on unix:<kitty_socket>` stored on `NvimSession.kitty_socket`. Used for `kitten @ quit` during teardown.
-- **Kitty PID tracking:** `NvimSession.kitty_pid` discovered at launch via `_get_window_owner_pid` (Quartz `kCGWindowListOptionIncludingWindow`). Used as SIGTERM fallback if `kitten @ quit` fails.
-- **iTerm2 window ID:** `NvimSession.iterm2_window_id` (str) captured from AppleScript `return windowId`. Used for `close window id` during teardown. Distinct from `terminal_window_id` (int, CGWindowID for screenshots).
+- **Terminal PID tracking:** `NvimSession.terminal_pid` discovered at launch via `_get_window_owner_pid` (Quartz). Used as SIGTERM fallback for kitty (if `kitten @ quit` fails) and ghostty. Shared field — no per-terminal PID fields.
+- **iTerm2 window ID:** `NvimSession.iterm2_window_id` (int | None) parsed from AppleScript `return windowId`. Used for `close window id` during teardown. Also assigned to `terminal_window_id` for screenshots.
 - **Screenshots:** `screencapture -l <window_id>` (macOS only). Linux returns "not yet supported"
 - **macOS dependencies:** `pyobjc-framework-Quartz` for CGWindowList APIs. Also uses system `osascript` and `screencapture`.
 

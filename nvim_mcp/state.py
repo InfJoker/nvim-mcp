@@ -39,6 +39,11 @@ _HEALTH_CHECK_TIMEOUT = 30.0
 _MAX_TERMINAL_SIZE = 500
 _TERMINAL_SOCKET_CONNECT_TIMEOUT = 15.0
 _TERMINAL_NAMES = {"kitty", "ghostty", "iterm2"}
+_TERMINAL_OWNER_NAMES: dict[str, str] = {
+    "kitty": "kitty",
+    "ghostty": "Ghostty",
+    "iterm2": "iTerm",
+}
 _WINDOW_ID_POLL_TIMEOUT = 5.0
 _WINDOW_ID_POLL_INTERVAL = 0.3
 _OSASCRIPT_FALLBACK_TIMEOUT = 3
@@ -46,6 +51,9 @@ _APPLESCRIPT_FOCUS_DELAY = 0.5
 _APPLESCRIPT_LAUNCH_TIMEOUT = 15
 _KITTEN_RPC_TIMEOUT = 5
 _ITERM2_CLOSE_TIMEOUT = 5
+_FRONTMOST_APP_TIMEOUT = 2
+_SCREENCAPTURE_TIMEOUT = 10
+_BLANK_SCREENSHOT_THRESHOLD = 500
 
 _VALID_SEVERITIES = {"ERROR", "WARN", "INFO", "HINT"}
 
@@ -88,10 +96,9 @@ class NvimSession:
     terminal_window_id: int | None = None
     terminal_title: str | None = None
     kitty_socket: str | None = None
-    kitty_pid: int | None = None
-    ghostty_pid: int | None = None
-    ghostty_windows_before: set[int] | None = None
-    iterm2_window_id: str | None = None
+    terminal_pid: int | None = None
+    windows_before: set[int] | None = None
+    iterm2_window_id: int | None = None
 
 
 _session: NvimSession | None = None
