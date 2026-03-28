@@ -81,6 +81,7 @@ def main() -> int:
         nvim_health_check,
         nvim_is_running,
         nvim_lua,
+        nvim_resize,
         nvim_screenshot,
         nvim_send_keys,
         nvim_start,
@@ -148,6 +149,32 @@ def main() -> int:
         check("buffer after edit", buf, ok=lambda r: "nvim_mcp_server" in r.lower())
     else:
         check("buffer after edit (autocommand)", "skipped")
+
+    # -- resize ------------------------------------------------------------
+    print("resize")
+    if headless:
+        check("resize (headless=unavailable)", nvim_resize(40, 120),
+              ok=lambda r: "headless" in r.lower() or "not supported" in r.lower())
+    elif terminal == "iterm2":
+        # iTerm2 resize breaks RPC — verify it returns an error, not a crash
+        check("resize (iterm2=unsupported)", nvim_resize(40, 120),
+              ok=lambda r: "not supported" in r.lower())
+    else:
+        check("resize", nvim_resize(40, 120), ok=lambda r: "Resized" in r)
+        time.sleep(0.3)
+        dims = nvim_lua("return { vim.o.lines, vim.o.columns }")
+        if terminal:
+            # Terminal mode: window manager may prevent resize (fullscreen, tiling).
+            # Verify the tool didn't error; dims may or may not match.
+            check("resize dims (terminal)", dims, ok=lambda r: "Error" not in r)
+        else:
+            # PTY mode: we control the terminal size directly
+            check("resize dims", dims, ok=lambda r: "40" in r and "120" in r)
+        # Resize back to original
+        check("resize back", nvim_resize(30, 100), ok=lambda r: "Resized" in r)
+        time.sleep(0.3)
+        check("resize validation", nvim_resize(0, 80),
+              ok=lambda r: "Error" in r)
 
     # -- health check ------------------------------------------------------
     print("health check")

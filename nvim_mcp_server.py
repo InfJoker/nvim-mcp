@@ -16,6 +16,7 @@ from nvim_mcp.tools import (
     nvim_health_check,
     nvim_is_running,
     nvim_lua,
+    nvim_resize,
     nvim_screenshot,
     nvim_send_keys,
     nvim_start,

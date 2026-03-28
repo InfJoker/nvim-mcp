@@ -427,8 +427,12 @@ def _start_terminal(
                 "--single-instance=no",
                 f"--title={s.terminal_title}",
                 f"--listen-on=unix:{s.kitty_socket}",
+                "-o", "allow_remote_control=yes",
                 "-o", "close_on_child_death=yes",
                 "-o", "macos_quit_when_last_window_closed=yes",
+                "-o", "remember_window_size=no",
+                "-o", f"initial_window_width={cols}c",
+                "-o", f"initial_window_height={rows}c",
                 "-e",
             ] + exe_cmd
             prev_app = _capture_frontmost_app()
@@ -449,6 +453,8 @@ def _start_terminal(
                 f"--title={s.terminal_title}",
                 f"--command={shlex.join(exe_cmd)}",
                 "--quit-after-last-window-closed=true",
+                f"--window-width={cols}",
+                f"--window-height={rows}",
             ]
             # Use `open -na` (not -gna): the -g flag prevents Ghostty's
             # window from appearing until clicked in the dock.
@@ -469,10 +475,22 @@ def _start_terminal(
                 f'tell application "iTerm2"\n'
                 f'  set newWindow to (create window with default profile'
                 f' command "{nvim_cmd_str}")\n'
+                # Set bounds immediately to prevent macOS auto-maximize.
+                # Also exits native fullscreen if the window was pulled
+                # into a fullscreen Space (works when in the same script).
+                f'  set bounds of newWindow to {{100, 100, 900, 600}}\n'
                 f'  set windowId to id of newWindow\n'
                 f'  tell current session of newWindow\n'
                 f'    set name to "{s.terminal_title}"\n'
+                f'    set refCols to columns\n'
+                f'    set refRows to rows\n'
                 f'  end tell\n'
+                f'  set cellW to 800.0 / refCols\n'
+                f'  set cellH to 500.0 / refRows\n'
+                f'  set newW to round ({cols} * cellW)\n'
+                f'  set newH to round ({rows} * cellH)\n'
+                f'  set bounds of newWindow'
+                f' to {{100, 100, 100 + newW, 100 + newH}}\n'
                 f'end tell\n'
                 f'try\n'
                 f'  delay {_APPLESCRIPT_FOCUS_DELAY}\n'
@@ -535,6 +553,57 @@ def _start_terminal(
             s.terminal_pid = _get_window_owner_pid(s.terminal_window_id)
 
     return s, None
+
+
+# ---------------------------------------------------------------------------
+# Terminal resize
+# ---------------------------------------------------------------------------
+
+
+def _resize_terminal(s: NvimSession, rows: int, cols: int) -> str | None:
+    """Resize the terminal window. Returns error string or None on success."""
+    if s.terminal == "kitty" and s.kitty_socket:
+        try:
+            kitten_bin = shutil.which("kitten") or "kitten"
+            r = subprocess.run(
+                [
+                    kitten_bin, "@", "--to", f"unix:{s.kitty_socket}",
+                    "resize-os-window",
+                    "--width", str(cols), "--height", str(rows),
+                    "--unit", "cells",
+                ],
+                capture_output=True, text=True, timeout=_KITTEN_RPC_TIMEOUT,
+            )
+            if r.returncode != 0:
+                return f"kitten resize failed: {r.stderr.strip()}"
+        except subprocess.TimeoutExpired:
+            return "kitten resize timed out"
+        except OSError as e:
+            return f"kitten resize failed: {e}"
+
+    elif s.terminal == "ghostty":
+        # Ghostty has no remote control API. Resize nvim's view of the
+        # terminal dimensions — the terminal window itself won't resize,
+        # but nvim will render within the requested cols×rows area.
+        try:
+            from nvim_mcp.rpc import NvimRPC as _NvimRPC
+            if isinstance(s.nvim, _NvimRPC):
+                s.nvim.command(f"set columns={cols} lines={rows}")
+            else:
+                return "Cannot resize ghostty: no RPC connection"
+        except _NVIM_ERRORS:
+            return "Failed to resize via nvim RPC"
+
+    elif s.terminal == "iterm2":
+        # Resizing iTerm2 via AppleScript `set bounds` breaks the nvim RPC
+        # socket permanently (nvim's server becomes unresponsive after the
+        # PTY resize triggered by the bounds change).
+        return "Resize not supported for iTerm2 (breaks RPC connection). Stop and restart with desired size."
+
+    else:
+        return f"Resize not supported for terminal: {s.terminal}"
+
+    return None
 
 
 # ---------------------------------------------------------------------------

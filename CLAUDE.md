@@ -51,6 +51,8 @@ nvim_mcp/
 | `_get_window_owner_pid` | `terminal.py` | Returns PID of a CGWindowID's owner via Quartz (`kCGWindowListOptionIncludingWindow`). |
 | `_env_wrapped_cmd` | `terminal.py` | Wraps a command with `/usr/bin/env VAR=val` for env vars differing from `os.environ`. |
 | `_teardown_terminal` | `terminal.py` | Multi-strategy terminal cleanup: process group kill (ghostty), `kitten @ quit` + PID SIGTERM (kitty), AppleScript `close window id` (iTerm2). |
+| `_resize_pty` | `pty.py` | Resizes PTY (ioctl TIOCSWINSZ) and pyte screen. Must run inside `_with_drained_pty`. |
+| `_resize_terminal` | `terminal.py` | Resizes terminal window: `kitten @ resize-os-window` (kitty), AppleScript (iTerm2), `set columns/lines` fallback (ghostty). |
 
 ### Session State
 
@@ -96,6 +98,22 @@ Interactive UI (Telescope, ToggleTerm, floating windows) blocks RPC because nvim
 4. **`_keys_to_raw` helper** — translates key notation (`<Esc>`, `<C-c>`, `<CR>`, etc.) to raw bytes for PTY writes. Case-insensitive (`<cr>` = `<CR>`). Uses `_RAW_KEY_MAP` dict (uppercase keys) and `_SPECIAL_KEY_RE` regex.
 5. **`_rpc_timeout` context manager** — temporarily overrides RPC timeout, restoring the actual previous value via `NvimRPC.get_timeout()`. Used by all interaction tools and `nvim_screenshot`.
 6. **`nvim_health_check`** — decomposed into 5 helpers: `_check_startup_messages`, `_run_checkhealth`, `_trigger_lazy_plugins`, `_check_plugin_errors`, `_check_diagnostics`. Each manages its own buffer cleanup.
+
+### Terminal Resize
+
+`nvim_resize` tool resizes the terminal across all modes:
+
+- **PTY mode**: Resize PTY via `ioctl(TIOCSWINSZ)` + pyte `screen.resize()` inside `_with_drained_pty`, then notify nvim via `set columns/lines` RPC **after** the reader resumes. The RPC command must run outside the drained context to avoid filling the PTY OS buffer while the reader is paused.
+- **Kitty**: `kitten @ resize-os-window --width {cols} --height {rows} --unit cells` via remote control socket.
+- **Ghostty**: No remote control API. Falls back to nvim `set columns/lines` — nvim renders within the requested area but the terminal window itself does not resize.
+- **iTerm2**: Not supported. Resizing via AppleScript `set bounds` breaks the nvim RPC connection permanently. Use `nvim_stop` + `nvim_start` with desired size instead.
+- **Headless**: Not supported (no visual terminal).
+
+Initial window size at launch:
+- **PTY**: `_create_pty(rows, cols)` sets PTY size via `ioctl(TIOCSWINSZ)`.
+- **Kitty**: `-o initial_window_width={cols}c -o initial_window_height={rows}c -o remember_window_size=no`.
+- **Ghostty**: `--window-width={cols} --window-height={rows}`.
+- **iTerm2**: AppleScript `set bounds` with cell-size measurement after window creation.
 
 ### Process Management
 

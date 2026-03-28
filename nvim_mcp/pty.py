@@ -150,6 +150,21 @@ def _pty_send_raw(s: NvimSession, data: bytes) -> bool:
         return False
 
 
+def _resize_pty(s: NvimSession, rows: int, cols: int) -> None:
+    """Resize PTY and pyte screen. Must be called inside _with_drained_pty.
+
+    Sets the PTY window size via ioctl and resizes the pyte virtual terminal.
+    Does NOT send RPC commands — the caller must notify nvim separately
+    (after the PTY reader is resumed) to avoid filling the PTY OS buffer
+    while the reader is paused.
+    """
+    if s.pty_master_fd is not None:
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(s.pty_master_fd, termios.TIOCSWINSZ, winsize)
+    if s.pyte_screen is not None:
+        s.pyte_screen.resize(rows, cols)
+
+
 def _wait_for_socket(path: str, timeout: float = _SOCKET_CONNECT_TIMEOUT) -> NvimRPC | None:
     """Poll until nvim's listen socket accepts connections."""
     deadline = time.time() + timeout

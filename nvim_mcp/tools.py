@@ -16,6 +16,7 @@ from nvim_mcp.pty import (
     _dismiss_press_enter,
     _init_pyte,
     _pty_send_raw,
+    _resize_pty,
     _spawn_nvim,
     _teardown,
     _wait_for_socket,
@@ -44,6 +45,7 @@ from nvim_mcp.state import (
 )
 from nvim_mcp.terminal import (
     _check_terminal_available,
+    _resize_terminal,
     _screenshot_terminal,
     _start_terminal,
     _teardown_terminal,
@@ -152,8 +154,8 @@ def nvim_start(
                   screenshots. Supported: "kitty", "ghostty", "iterm2" (macOS only).
                   Mutually exclusive with headless. Empty string (default) uses PTY mode.
         args: Extra CLI arguments to pass to nvim.
-        rows: Terminal rows (only used when headless=False).
-        cols: Terminal columns (only used when headless=False).
+        rows: Terminal rows (PTY and terminal modes; ignored in headless).
+        cols: Terminal columns (PTY and terminal modes; ignored in headless).
     """
     _session = get_session()
 
@@ -168,7 +170,7 @@ def nvim_start(
         if term_err:
             return f"Error: {term_err}"
 
-    if not headless and not terminal and (rows < 1 or cols < 1 or rows > _MAX_TERMINAL_SIZE or cols > _MAX_TERMINAL_SIZE):
+    if not headless and (rows < 1 or cols < 1 or rows > _MAX_TERMINAL_SIZE or cols > _MAX_TERMINAL_SIZE):
         return f"Error: rows and cols must be between 1 and {_MAX_TERMINAL_SIZE}."
 
     config = os.path.expanduser(config)
@@ -253,7 +255,7 @@ def nvim_start(
             pass
 
     if terminal:
-        mode_str = f"terminal:{terminal}"
+        mode_str = f"terminal:{terminal} {cols}x{rows}"
     elif headless:
         mode_str = "headless"
     else:
@@ -357,6 +359,51 @@ def nvim_is_running() -> str:
         return json.dumps({"running": True, "pid": _session.pid})
     except _NVIM_ERRORS:
         return json.dumps({"running": False, "error": "connection lost"})
+
+
+@mcp.tool()
+def nvim_resize(rows: int, cols: int) -> str:
+    """Resize the Neovim terminal.
+
+    Works in PTY mode (resizes PTY + pyte screen) and terminal mode
+    (resizes the terminal emulator window). Not supported in headless mode.
+
+    Args:
+        rows: New terminal height in rows.
+        cols: New terminal width in columns.
+    """
+    if rows < 1 or cols < 1 or rows > _MAX_TERMINAL_SIZE or cols > _MAX_TERMINAL_SIZE:
+        return f"Error: rows and cols must be between 1 and {_MAX_TERMINAL_SIZE}."
+
+    try:
+        _require_nvim()
+        s = get_session()
+
+        if s.pty_master_fd is not None:
+            # PTY mode: resize PTY + pyte inside drained context, then
+            # notify nvim via RPC *after* the reader resumes so redraw
+            # output doesn't fill the PTY buffer while the reader is paused.
+            with _with_drained_pty(s):
+                with s.pty_lock:
+                    _resize_pty(s, rows, cols)
+            # Reader is now active — safe to trigger nvim redraw
+            try:
+                s.nvim.command(f"set columns={cols} lines={rows}")
+            except _NVIM_ERRORS:
+                pass
+            return f"Resized to {cols}x{rows}."
+
+        if s.terminal is not None:
+            # Terminal mode
+            err = _resize_terminal(s, rows, cols)
+            if err:
+                return f"Error: {err}"
+            return f"Resized to {cols}x{rows}."
+
+        # Headless mode
+        return "Error: resize not supported in headless mode (no terminal)."
+    except _NVIM_ERRORS as e:
+        return f"Error: {e}"
 
 
 # ---------------------------------------------------------------------------
