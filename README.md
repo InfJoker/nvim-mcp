@@ -32,37 +32,6 @@ Clone the repo and register in `~/.claude/.mcp.json`:
 
 Dependencies are managed automatically by `uv run --project`.
 
-## Tools
-
-### Lifecycle
-
-| Tool | Params |
-|------|--------|
-| `nvim_start` | `config`, `clean`, `headless`, `terminal`, `args`, `rows`, `cols` |
-| `nvim_stop` | — |
-| `nvim_is_running` | — |
-
-### Interaction
-
-| Tool | Params |
-|------|--------|
-| `nvim_execute` | `command`, `timeout` |
-| `nvim_lua` | `code`, `timeout` |
-| `nvim_send_keys` | `keys`, `escape`, `timeout` |
-
-### Inspection
-
-| Tool | Params |
-|------|--------|
-| `nvim_get_buffer` | `buffer_id` |
-| `nvim_get_state` | — |
-| `nvim_get_messages` | `clear` |
-| `nvim_get_diagnostics` | `buffer_id`, `severity` |
-| `nvim_screenshot` | `output_path` |
-| `nvim_health_check` | — |
-
-Tool descriptions and usage guidance are in the tool docstrings (visible to AI models via MCP).
-
 ## Testing
 
 ```bash
